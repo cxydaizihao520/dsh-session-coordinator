@@ -35,7 +35,7 @@ function fixture() {
     tools: { register(tool) { tools.set(tool.name, tool) } }, sessions: { flush: async () => true },
     agents: { get: id => agents.get(id), list: () => [...agents.values()], async create(options) { effects.push(['create']); return { agent: make(options.sessionId) } } },
     workspaceRegistry: { archivedSessionIds: [], list: () => [], resolveByPath: async () => undefined },
-    agentPresets: { composeFrom() {} },
+    agentPresets: { composedPreset() {}, composeFrom() {} },
   }
   const env = { ctx, grants: createGrants(), registry: { touch() {}, record() {} } }
   registerBridgeTools(env)

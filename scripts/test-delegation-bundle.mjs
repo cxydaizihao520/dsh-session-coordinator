@@ -15,6 +15,7 @@ try {
  const a={id,session,ctx:{},status:'idle',steer(m){session.append('user/message',m,{surfaceOp:'append'})},followup(m){this.steer(m)},inbox:{nextStep:[],nextTurn:[]}};agents.set(id,a);return a}
  const ctx={get:n=>n==='approval'?{request:async()=> 'allowed-once'}:undefined,tools:{register:t=>tools.set(t.name,t)},
  agents:{list:()=>[],get:id=>agents.get(id),create:async o=>({agent:make(o.sessionId)})},
+ agentPresets:{composedPreset:()=>undefined,composeFrom:()=>undefined},
  sessions:{flush:async()=>true},workspaceRegistry:{list:()=>[],archivedSessionIds:[],resolveByPath:async()=>undefined},
  inject(){},on(){},effect(){},setInterval(){return 0},clearInterval(){}}
  make('A');apply(ctx)

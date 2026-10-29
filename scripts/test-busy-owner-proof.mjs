@@ -59,3 +59,13 @@ test('independent native request evidence remains decisive when the optional run
   value.report.requestInclusions[0].message = structuredClone(value.report.inboundResults[0].message)
   assert.throws(() => verify(value), /canonical business result/)
 })
+
+test('an invented result operation ID followed by successful recovery cannot hide a protocol error', () => {
+  const value = sample()
+  value.report.tools.push({ sessionId: 'B', name: 'session_coordinator_collaboration_result', callId: 'wrong-result', arguments: JSON.stringify({ scopeId: 'scope', taskId: 'task', taskRevision: 1, operationId: 'invented-result-operation', text: 'ITEMS_TOTAL=71' }) })
+  value.report.errors.push({ sessionId: 'B', data: { message: { toolCallId: 'wrong-result', isError: true, content: [{ type: 'text', text: 'Error: result must answer this session’s exact task operation and revision' }] } } })
+  assert.throws(() => verify(value), 'Successful persisted result and integration do not erase the wrong-ID tool failure')
+  value.report.errors = []
+  value.scope.results.result.operationId = 'invented-result-operation'
+  assert.throws(() => verify(value), 'Only the original admitted operation can own the result')
+})

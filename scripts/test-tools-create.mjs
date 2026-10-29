@@ -99,7 +99,8 @@ function harness(options = {}) {
         : undefined),
     },
     agentPresets: {
-      composeFrom: (_agentCtx, parentCtx) => { composed.push(parentCtx); return 'composed' },
+      composedPreset: () => options.inheritedPreset,
+      composeFrom: (_agentCtx, parentCtx) => { composed.push(parentCtx); return options.joinedPreset ?? options.inheritedPreset },
       mount: async (_agentCtx, id) => { mounted.push(id) },
     },
     sessionPersistence: { open: async () => { throw new Error('not used') } },
@@ -256,11 +257,21 @@ await test('create: explicit model overrides beat the caller conversation', asyn
 })
 
 await test('create: an explicit agentPreset is mounted instead of joining the caller', async () => {
-  const h = harness()
+  const h = harness({ inheritedPreset: 'inherited' })
   await h.run({ cwd: 'D:/target', agentPreset: 'reviewer' }, true)
   assert.equal(h.createCalls[0].meta.agentPreset, 'reviewer')
   assert.deepEqual(h.mounted, ['reviewer'])
   assert.equal(h.composed.length, 0, 'an explicit preset must not also join the caller composition')
+})
+
+await test('create: implicitly inherited preset identity is durable while setup still joins the retained revision', async () => {
+  const h = harness({ inheritedPreset: 'inherited' })
+  await h.run({ cwd: 'D:/target' }, true)
+  assert.equal(h.createCalls[0].meta.agentPreset, 'inherited')
+  assert.equal(h.composed.length, 1); assert.deepEqual(h.mounted, [])
+  const changed = harness({ inheritedPreset: 'inherited', joinedPreset: 'changed' })
+  await assert.rejects(changed.run({ cwd: 'D:/target' }, true), /preset changed/)
+  assert.equal(changed.records.length, 0); assert.equal(changed.followups.length, 0)
 })
 
 console.log('')

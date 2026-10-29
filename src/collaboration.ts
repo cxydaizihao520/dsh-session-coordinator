@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { MessageId, HarnessError, isAgentLoopRequest, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { BridgeEnv } from './tools.ts'
-import { resolveTargetCwd, type LiveAgentLike } from './core.ts'
+import { isUserFacingSource, resolveTargetCwd, type LiveAgentLike } from './core.ts'
 import { createBridgeSession, validateBridgeSessionModel, type CreateBridgeSessionOptions } from './session-create.ts'
 import { requestCoordinationApproval } from './delivery.ts'
 import type { CollaborationMaterialInput } from './collaboration-materials.ts'
@@ -472,9 +472,14 @@ export class CollaborationRuntime {
       if (op.resultId) throw new Error('operation already has a result')
       if (op.status !== 'admitted') throw new Error('result requires an operation admitted into this session’s model history')
       const stale = current.revision !== input.taskRevision
+      // Exact repeated evidence is observable duplication; wording changes still rely on total/time budgets.
+      const repeated = current.resultIds.some(id => {
+        const prior = next.results[id]!
+        return prior.taskRevision === input.taskRevision && prior.sender === caller.id && prior.text === value && isDeepStrictEqual(prior.evidence, evidence)
+      })
       const result: CollaborationResult = { id: resultId, taskId: task.id, taskRevision: input.taskRevision, operationId: op.id, sender: caller.id, text: value, evidence: [...evidence], createdAt: Date.now(), stale }
       next.results[resultId] = result; op.resultId = resultId; current.resultIds.push(resultId)
-      if (!stale && current.state === 'active' && next.state === 'active') { current.noProgress = 0; current.scheduling = 'ready'; delete current.waitReason }
+      if (!stale && current.state === 'active' && next.state === 'active') { if (!repeated) current.noProgress = 0; current.scheduling = 'ready'; delete current.waitReason }
       return result
     })
     // Persisted result identity arbitrates all notification/wait consumers.
@@ -532,7 +537,11 @@ export class CollaborationRuntime {
       this.caller(exec)
       const task = input.taskId ? this.task(next, input.taskId, original.tasks[input.taskId]?.revision) : undefined
       const target = task ?? next
-      if (stopped.has(target.state)) throw new Error('terminal collaboration cannot be resumed or changed')
+      if (stopped.has(target.state)) {
+        if (!task) throw new Error('terminal collaboration cannot be resumed or changed')
+        if (task.state === 'completed') throw new Error('terminal task is completed; preserve its accepted results and continue other active tasks. When every task is completed, finish the scope without taskId and include accepted resultIds')
+        throw new Error('terminal task is ' + task.state + '; preserve its terminal state. To close the remaining scope, use collaboration_control action=cancel or action=fail without taskId; do not use legacy whole-session cancel')
+      }
       if (input.action === 'finish' || input.action === 'revalidate') {
         const resultIds = names(input.resultIds, 'resultIds')
         if (resultIds.some(id => !next.results[id] || (task && (next.results[id]!.taskId !== task.id || (input.action !== 'revalidate' && next.results[id]!.taskRevision !== task.revision && !task.acceptedResultIds.includes(id)))))) throw new Error('completion requires evidence for the current task revision')
@@ -543,7 +552,7 @@ export class CollaborationRuntime {
           return
         }
         if (task) task.acceptedResultIds = resultIds
-        else if (Object.values(next.tasks).length === 0 || Object.values(next.tasks).some(t => t.state !== 'completed')) throw new Error('finish each task before finishing the collaboration')
+        else if (Object.values(next.tasks).length === 0 || Object.values(next.tasks).some(t => t.state !== 'completed')) throw new Error('finish each task before finishing the collaboration. If any task is cancelled or failed, preserve its terminal state and close the remaining scope with collaboration_control action=cancel or action=fail without taskId; do not finish cancelled tasks or use legacy whole-session cancel')
         target.state = 'completed'; target.reason = text(input.reason, 'completion reason')
       } else if (input.action === 'revise') {
         if (!task) throw new Error('revise requires taskId; scope expansion requires a new approved collaboration')
@@ -754,7 +763,10 @@ export class CollaborationRuntime {
       const attention = taskIds.filter(id => scope.tasks[id]!.state === 'recovery-required' && scope.tasks[id]!.attention?.taskRevision === scope.tasks[id]!.revision).map(taskId => ({ taskId, ...scope.tasks[taskId]!.attention! }))
       const ready = taskIds.filter(id => results.some(r => r.taskId === id) || stopped.has(scope.tasks[id]!.state) || attention.some(item => item.taskId === id))
       const done = input.mode === 'all' ? ready.length === taskIds.length : ready.length > 0
-      if (done || attention.length || exec.signal.aborted || !this.active || Date.now() - started >= timeoutMs) return { needsAttention: attention.length > 0, attention, results: structuredClone(results), tasks: taskIds.map(id => structuredClone(scope.tasks[id]!)), done, timedOut: !done && !attention.length && !exec.signal.aborted && this.active, aborted: exec.signal.aborted || !this.active }
+      // Release the tool so native next-step admission can consume the user's steering input.
+      const pendingUserInput = caller.inbox?.nextStep?.some(message => { const input = message as Partial<UserMessage> | null; return input?.role === 'user' && input.source?.kind === 'user' }) === true
+      const interrupted = pendingUserInput || scope.state !== 'active' || taskIds.some(id => scope.tasks[id]!.state !== 'active' && !stopped.has(scope.tasks[id]!.state))
+      if (done || attention.length || interrupted || exec.signal.aborted || !this.active || Date.now() - started >= timeoutMs) return { needsAttention: attention.length > 0, attention, results: structuredClone(results), tasks: taskIds.map(id => structuredClone(scope.tasks[id]!)), done, scopeState: scope.state, ...(scope.reason ? { reason: scope.reason } : {}), ...(pendingUserInput ? { pendingUserInput: true } : {}), interrupted, timedOut: !done && !attention.length && !interrupted && !exec.signal.aborted && this.active, aborted: exec.signal.aborted || !this.active }
       await new Promise<void>(resolve => { const timer = setTimeout(finish, Math.min(50, timeoutMs - (Date.now() - started))); function finish() { clearTimeout(timer); exec.signal.removeEventListener('abort', finish); resolve() } exec.signal.addEventListener('abort', finish, { once: true }) })
     }
   }
@@ -910,7 +922,11 @@ export class CollaborationRuntime {
     }))
     this.disposers.push(on('agent/error', ({ agent, turn, error }) => executionError(agent, turn, error ?? {})))
     this.disposers.push(on('agent/turn-stopping', ({ agent, turn, signal }) => this.continueActionable(agent, turn, signal)))
-    this.disposers.push(on('agent/inbox/claimed', ({ agent, message, turn }) => updateMessage(agent, message, 'claimed', turn)))
+    this.disposers.push(on('agent/inbox/claimed', ({ agent, message, turn }) => {
+      const execution = this.executions.get(agent)
+      if (execution && execution.turn === turn && this.env.ctx.agents.get(agent.id as never) === agent) execution.inputs.set(message.id, message)
+      updateMessage(agent, message, 'claimed', turn)
+    }))
     this.disposers.push(on('agent/inbox/discarded', ({ agent, message }) => updateMessage(agent, message, 'discarded')))
     this.disposers.push(on('session/event', (session, event) => {
       const agent = this.env.ctx.agents.get(session.id as never) as unknown as LiveAgentLike | undefined
@@ -965,7 +981,8 @@ export class CollaborationRuntime {
       }
       if (event.type === 'user/message') {
         if (event.data.source?.kind === 'user' && session.isOwnSeq?.(event.seq) !== false) void this.recordHumanInput(agent, event.data, event.seq).catch(error => console.warn('[session-coordinator] participant correction pending:', errorText(error)))
-        if (event.data.source?.kind !== 'runtime-context') this.executions.get(agent)?.inputs.set(event.data.id, event.data)
+        // Claims identify native incoming work; generated prompt context is also logged as user/message.
+        if (isUserFacingSource(event.data.source?.kind)) this.executions.get(agent)?.inputs.set(event.data.id, event.data)
         updateMessage(agent, event.data, 'admitted', this.executions.get(agent)?.turn)
       }
     }))

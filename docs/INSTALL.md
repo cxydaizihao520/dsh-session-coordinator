@@ -25,14 +25,14 @@
 3. 安装刚生成的包到桌面 profile：
 
    ```bash
-   dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.2.tgz
+   dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.6.tgz
    ```
 
    版本升级后使用上一步真实生成的包名。安装到其他 profile 不会更新桌面实例。通过打包安装，桌面使用的是包快照；后续修改源码需要重新构建、打包和安装。
 
 4. 正常重启 Harness。先保存工作并处理运行中任务；如果应用提示退出将中断任务，由使用者决定等待或中断。安装授权不自动授权中断其他任务。
 
-5. 打开“插件 → dsh-session-coordinator”，核对版本为 **0.2.2**、插件及组件已启用。发送下面的试用任务，完成条件是实际出现指定独立会话并收到其结果；工具注册或版本号正确不等于任务已跑通。
+5. 打开“插件 → dsh-session-coordinator”，核对版本为 **0.2.6**、插件及组件已启用。发送下面的试用任务，完成条件是实际出现指定独立会话并收到其结果；工具注册或版本号正确不等于任务已跑通。
 
    > 请新建一个独立主会话，命名“协作试用·核算”，与我当前会话持续协作：第一轮计算 17+26；收到真实结果后，再让同一个会话换一种方法复核；我当前会话核对后交付结论并结束这次协作。只联系这个新会话，不读写文件、不安装依赖。首次审批后允许任务内自动往返。
 
@@ -54,7 +54,7 @@
    pnpm build
    pnpm smoke
    pnpm pack
-   dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.2.tgz
+   dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.6.tgz
    ```
 
 3. 正常重启，按首次安装第 5 步核对版本并实际试用。不需要新建工作区、删除聊天或清空历史。

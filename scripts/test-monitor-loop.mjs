@@ -123,7 +123,7 @@ function harness(options = {}) {
       },
     },
     workspaceRegistry: { list: () => [], resolveByPath: async () => undefined, get: () => undefined },
-    agentPresets: { composeFrom: () => undefined, mount: async () => undefined },
+    agentPresets: { composedPreset: () => undefined, composeFrom: () => undefined, mount: async () => undefined },
     sessionPersistence: { open: async () => { throw new Error('not used') } },
     setInterval: () => 0,
     clearInterval: () => {},

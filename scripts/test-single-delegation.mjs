@@ -22,7 +22,7 @@ function fixture(){
   tools:{register:t=>tools.set(t.name,t)},sessions:{async flush(s){const ok=await flush(s);if(ok)durable.set(s.id,{header:s.header,events:structuredClone(s.snapshotEvents()),inheritedEventCount:s.inheritedEventCount});return ok}},
   sessionPersistence:{async open(id,mode){assert.equal(mode,'read');const d=durable.get(id);if(!d)throw Error('missing log');return {...d,read:async()=>({events:d.events}),close:async()=>{effects.push(['close',id])}}}},
   agents:{get:id=>agents.get(id),list:()=>[],async create(o){effects.push(['create',o.sessionId]);return {agent:make(o.sessionId)}}},
-  workspaceRegistry:{archivedSessionIds:[],list:()=>[],resolveByPath:async()=>undefined},agentPresets:{composeFrom(){}}
+  workspaceRegistry:{archivedSessionIds:[],list:()=>[],resolveByPath:async()=>undefined},agentPresets:{composedPreset(){},composeFrom(){}}
  }
  const grants=createGrants(),registry={touch(){},record(){}}
  const env={ctx,grants,registry};registerBridgeTools(env)

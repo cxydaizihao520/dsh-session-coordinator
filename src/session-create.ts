@@ -11,7 +11,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
 import * as agentApi from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import {
@@ -119,12 +119,14 @@ export async function createBridgeSession(
     }): Promise<{ agent: LiveAgentLike }>
   }
   const requestedPreset = typeof options.agentPreset === 'string' && options.agentPreset.trim() !== '' ? options.agentPreset.trim() : undefined
+  const presets = ctx.agentPresets as unknown as { composedPreset(agentCtx: Context): string | undefined; composeFrom(agentCtx: Context, parentCtx: Context): string | undefined; mount(agentCtx: Context, id: string): Promise<unknown> }
+  const persistedPreset = requestedPreset ?? (caller ? presets.composedPreset(caller.ctx) : undefined)
   options.signal?.throwIfAborted()
   const handle = await agents.create({
     sessionId,
     meta: {
       cwd: targetCwd,
-      ...(requestedPreset === undefined ? {} : { agentPreset: requestedPreset }),
+      ...(persistedPreset === undefined ? {} : { agentPreset: persistedPreset }),
     },
     agentOptions: {
       ...(provider !== '' ? { provider } : {}),
@@ -135,11 +137,9 @@ export async function createBridgeSession(
       if (requestedPreset !== undefined) {
         // 显式 agentPreset 就组合那一个预设。落到下面的 caller-join 会静默忽略请求：
         // id 仍然写进 session header，而 agent 实际跑在调用方的既有组合与工具上。
-        const presets = ctx.agentPresets as unknown as { mount(agentCtx: Context, id: string): Promise<unknown> }
         await presets.mount(agentCtx, requestedPreset)
       } else if (caller !== undefined) {
-        const presets = ctx.agentPresets as unknown as { composeFrom(agentCtx: Context, parentCtx: Context): string | undefined }
-        presets.composeFrom(agentCtx, caller.ctx)
+        if (presets.composeFrom(agentCtx, caller.ctx) !== persistedPreset) throw new Error('caller preset changed before session composition; retry creation after inspection')
       }
       if (installModelSelection !== undefined) {
         installModelSelection(agentCtx, selection)
@@ -204,8 +204,62 @@ export async function createBridgeSession(
 
 export interface ResumeArgs { sessionId: string; provider?: string; model?: string; reasoningEffort?: string }
 
-export async function resumeBridgeSession(ctx: Context, registry: BridgeRegistry, args: ResumeArgs): Promise<Record<string, unknown>> {
-  if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
+/** Native headless only registers a live lookup; compose cold targets through the same public setup APIs. */
+async function resumeComposedSession(ctx: Context, args: ResumeArgs): Promise<LiveAgentLike> {
+  const query = ctx.get?.('sessionQuery') as { observeSession(id: string): Promise<{
+    header: { id: string; cwd?: string; origin?: string; agentPreset?: string }
+    events: readonly SessionEvent[]
+    projections?: { values: { agentPreset?: string | null; modelSelection?: { lastUsed: ModelSelectionRef['current'] | null; next: ModelSelectionRef['current'] | null } } }
+    [Symbol.dispose](): void
+  }> } | undefined
+  if (!query) throw new Error('cold session composition requires native sessionQuery support')
+  const observation = await query.observeSession(args.sessionId)
+  try {
+    if (observation.header.id !== args.sessionId || !observation.header.cwd) throw new Error('cold session has no exact persisted working directory')
+    if (observation.header.origin === 'subagent') throw new Error('cold subagent session must use native subagent routing')
+    const values = observation.projections?.values
+    if (values?.agentPreset === undefined && (observation.header.agentPreset || observation.events.some(event => event.type === 'agent-preset/selected'))) throw new Error('cold session requires its native agentPreset projection')
+    if (!values?.modelSelection && observation.events.some(event => (event.type as string) === 'model/selection')) throw new Error('cold model selection requires its native modelSelection projection')
+    const logged = observation.events.filter(event => event.type === 'request/header').at(-1)?.data.header
+    const defaults = ctx.get?.('agentDefaultModel') as { currentSelection(): ModelSelectionRef['current'] } | undefined
+    const fromHeader = (header: typeof logged) => header ? {
+      provider: header.config.provider, model: header.config.model,
+      ...(header.config.reasoningEffort === undefined || header.adapterDefaults?.reasoningEffort === true ? {} : { reasoningEffort: header.config.reasoningEffort }),
+    } : defaults?.currentSelection()
+    const prior = fromHeader(logged)
+    const select = (prior: ModelSelectionRef['current']) => {
+      const routeChanged = args.provider !== undefined && args.provider !== prior?.provider || args.model !== undefined && args.model !== prior?.model
+      const selected = { ...prior, ...(routeChanged ? { reasoningEffort: undefined } : {}),
+        ...(args.provider ? { provider: args.provider } : {}), ...(args.model ? { model: args.model } : {}),
+        ...(args.reasoningEffort ? { reasoningEffort: args.reasoningEffort } : {}) }
+      if (!selected.provider || !selected.model) throw new Error('cold session has no native model selection to restore')
+      return selected
+    }
+    const presets = ctx.get?.('agentPresets') as { resolve(id: string): Promise<{ id: string }>; mount(agentCtx: Context, id: string): Promise<unknown> } | undefined
+    const presetId = values?.agentPreset ?? undefined
+    if (presetId && !presets) throw new Error('cold session preset composition is unavailable')
+    const preset = presetId ? await presets!.resolve(presetId) : undefined
+    const install = (agentApi as unknown as { installModelSelection?: (agentCtx: Context, selection: ModelSelectionRef) => () => void }).installModelSelection
+    if (!install) throw new Error('cold session requires native installModelSelection support')
+    const agents = ctx.agents as unknown as { resume(options: { resumeSessionId: string; agentOptions: Record<string, unknown>; setup(agentCtx: Context, agent: LiveAgentLike): Promise<void> }): Promise<{ agent: LiveAgentLike }> }
+    const projection = ctx.get?.('sessionProjections') as { stateOf(session: LiveAgentLike['session'], key: string): { pending: ModelSelectionRef['current'] | null } | undefined } | undefined
+    const handle = await agents.resume({ resumeSessionId: args.sessionId, agentOptions: select(prior ?? values?.modelSelection?.next ?? undefined),
+      setup: async (agentCtx, agent) => {
+        // Observation values are wire views {lastUsed,next}; native stateOf retains exact pending intent.
+        const state = values?.modelSelection ? projection?.stateOf(agent.session, 'modelSelection') : undefined
+        if (values?.modelSelection && !state) throw new Error('cold model selection requires its native modelSelection state')
+        if (!state && sessionEvents(agent.session).some(event => (event.type as string) === 'model/selection')) throw new Error('cold model selection requires its native modelSelection state')
+        const selected = select(state?.pending ?? fromHeader(agent.session.requestHeader()))
+        await validateBridgeSessionModel(ctx, selected)
+        install(agentCtx, { current: selected })
+        if (preset) await presets!.mount(agentCtx, preset.id)
+      },
+    })
+    return handle.agent
+  } finally { observation[Symbol.dispose]() }
+}
+
+async function resumeBridgeSessionOnce(ctx: Context, registry: BridgeRegistry, args: ResumeArgs): Promise<Record<string, unknown>> {
   const existing = getLiveAgent(ctx, args.sessionId)
   if (existing !== undefined) {
     registry.touch(args.sessionId)
@@ -233,19 +287,16 @@ export async function resumeBridgeSession(ctx: Context, registry: BridgeRegistry
   if (header === undefined) {
     throw new Error('session ' + JSON.stringify(args.sessionId) + ' is unknown (no live agent and no persisted log) — use session_coordinator_find to locate existing sessions')
   }
-  const agents = ctx.agents as unknown as {
-    resume(options: { resumeSessionId: string; agentOptions?: Record<string, unknown> }): Promise<{ agent: LiveAgentLike }>
-  }
   const agentOptions: Record<string, unknown> = {}
   if (typeof args.provider === 'string' && args.provider !== '') agentOptions.provider = args.provider
   if (typeof args.model === 'string' && args.model !== '') agentOptions.model = args.model
   if (typeof args.reasoningEffort === 'string' && args.reasoningEffort !== '') agentOptions.reasoningEffort = args.reasoningEffort
   // 桌面解析器同时恢复模型选择与预设；裸 agents.resume 缺少 prompt 装配。
-  const typert = (ctx as unknown as { typert?: { lookups: { get(key: string): { resolve(id: string): Promise<LiveAgentLike> } | undefined } } }).typert
+  const typert = (ctx as unknown as { typert?: { lookups: { get(key: string): { resolve(id: string): Promise<LiveAgentLike | undefined> } | undefined } } }).typert
   const resolver = typert?.lookups.get('agent')
-  const handle = resolver !== undefined && Object.keys(agentOptions).length === 0
-    ? { agent: await resolver.resolve(args.sessionId) }
-    : await agents.resume({ resumeSessionId: args.sessionId, ...(Object.keys(agentOptions).length > 0 ? { agentOptions } : {}) })
+  // Native desktop policy errors are authoritative; fallback only when no cold resolver handles this identity.
+  const resolved = resolver !== undefined && Object.keys(agentOptions).length === 0 ? await resolver.resolve(args.sessionId) : undefined
+  const agent = resolved ?? await resumeComposedSession(ctx, args)
   const headerCwd = header.cwd
   const resumeWorkspaceId = await attachSessionToWorkspace(ctx, args.sessionId as SessionId, headerCwd) ?? workspaceByPath(ctx, headerCwd)
   registry.record({
@@ -258,6 +309,23 @@ export async function resumeBridgeSession(ctx: Context, registry: BridgeRegistry
     sessionId: args.sessionId,
     resumed: true,
     ...(headerCwd === undefined ? {} : { cwd: headerCwd }),
-    title: titleOf(sessionEvents(handle.agent.session)) ?? null,
+    title: titleOf(sessionEvents(agent.session)) ?? null,
   }
+}
+
+// Native controller deduplicates cold resumes; headless needs the same boundary before opening a writer.
+const coldResumes = new WeakMap<Context, Map<string, { fingerprint: string; promise: Promise<Record<string, unknown>> }>>()
+export async function resumeBridgeSession(ctx: Context, registry: BridgeRegistry, args: ResumeArgs): Promise<Record<string, unknown>> {
+  if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
+  if (getLiveAgent(ctx, args.sessionId)) return resumeBridgeSessionOnce(ctx, registry, args)
+  const pending = coldResumes.get(ctx) ?? new Map()
+  const fingerprint = JSON.stringify([args.provider, args.model, args.reasoningEffort])
+  const existing = pending.get(args.sessionId)
+  if (existing) {
+    if (existing.fingerprint !== fingerprint) throw new Error('cold session resume already pending with another model selection')
+    return existing.promise
+  }
+  const promise = resumeBridgeSessionOnce(ctx, registry, args).finally(() => { pending.delete(args.sessionId) })
+  pending.set(args.sessionId, { fingerprint, promise }); coldResumes.set(ctx, pending)
+  return promise
 }

@@ -1,6 +1,6 @@
 {
   "id": "dsh-external/dsh-session-coordinator",
-  "version": "0.2.2",
+  "version": "0.2.6",
   "main": "./lib/index.js",
   "description": "独立主会话之间交接任务、同步信息和取得结果；经目标、成员和预算审批后支持总控 + N 的多任务持续协作与审查返工。另保留单次任务往返、查找、回执、监控及归档能力。旧单次模式的两跳防环仅约束旧消息链。",
   "engines": {

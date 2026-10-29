@@ -149,7 +149,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(windowed)), windowed)
 // The artifact must not ship a stale DSH copy (the 0.3.3 regression).
 assert.ok(!readFileSync(BUNDLE, 'utf8').includes('0.1.7-alpha'), 'lib/index.js must not inline alpha DSH code')
 
-// --- plugin switch + /cot-loop command (0.7.0) --------------------------------
+// --- plugin switch + /cot-loop command ----------------------------------------
 // Two artifact-level contracts: (1) the bundle exports the volatile Config that
 // the Plugins settings form renders (dsh-settings only shows volatile fields),
 // and (2) the /cot-loop slash command is registered against a host command

@@ -511,7 +511,7 @@ await test('恢复目标期间 off 撤销：投递前停止，且不会留下可
   let release
   const pending = new Promise(resolve => { release = resolve })
   h.ctx.sessionPersistence = { list: async () => [{ header: { id: 'B', createdAt: 1 } }] }
-  h.ctx.agents.resume = async () => { await pending; h.agents.set('B', target); return { agent: target } }
+  h.ctx.typert = { lookups: { get: () => ({ resolve: async () => { await pending; h.agents.set('B', target); return target } }) } }
   const send = h.run('send', { sessionId: 'B', message: '任务' })
   h.grants.revoke('A'); h.delivery.revoke('A'); release()
   await assert.rejects(() => send, /authorization changed|not authorized/)
