@@ -1,0 +1,38 @@
+{
+  "id": "dsh-external/dsh-session-coordinator",
+  "version": "0.2.2",
+  "main": "./lib/index.js",
+  "description": "独立主会话之间交接任务、同步信息和取得结果；经目标、成员和预算审批后支持总控 + N 的多任务持续协作与审查返工。另保留单次任务往返、查找、回执、监控及归档能力。旧单次模式的两跳防环仅约束旧消息链。",
+  "engines": {
+    "dsh": ">=0.2.1-rc.1"
+  },
+  "contributes": {
+    "tools": [
+      "session_coordinator_create",
+      "session_coordinator_send",
+      "session_coordinator_resume",
+      "session_coordinator_wait",
+      "session_coordinator_segments",
+      "session_coordinator_read",
+      "session_coordinator_message_status",
+      "session_coordinator_find",
+      "session_coordinator_status",
+      "session_coordinator_cancel",
+      "session_coordinator_monitor_start",
+      "session_coordinator_monitor_stop",
+      "session_coordinator_monitor_list",
+      "session_coordinator_archive",
+      "session_coordinator_unarchive",
+      "session_coordinator_archived",
+      "session_coordinator_collaboration_start",
+      "session_coordinator_collaboration_task",
+      "session_coordinator_collaboration_send",
+      "session_coordinator_collaboration_result",
+      "session_coordinator_collaboration_control",
+      "session_coordinator_collaboration_status",
+      "session_coordinator_collaboration_wait",
+      "session_coordinator_collaboration_material"
+    ],
+    "skills": []
+  }
+}

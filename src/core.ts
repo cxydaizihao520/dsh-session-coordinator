@@ -1,0 +1,925 @@
+/**
+ * dsh-session-coordinator core: 会话创建 / 发消息 / 等待回复 / 读取 / 查找。
+ * 所有逻辑跑在插件宿主上下文（rootCtx），操作的是 DSH 真实的会话与 agent 注册表。
+ */
+import { randomUUID } from 'node:crypto'
+import { MessageId } from '@deepseek-ai/dsh-llm'
+import type { Context } from '@deepseek-ai/cordis'
+import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-session-persistence'
+import { WorkspaceId, type Workspace } from '@deepseek-ai/dsh-workspace'
+import type { BridgeDescendantInfo } from './handoff.ts'
+
+const AUTOMATION_SOURCE_KIND = 'session-coordinator-automation' as const
+
+declare module '@deepseek-ai/dsh-llm/message' {
+  interface MessageSourceMap {
+    'session-message': { kind: typeof SOURCE_KIND } & Omit<SourceIdentity, 'senderLabel'>
+    'session-coordinator-automation': { kind: typeof AUTOMATION_SOURCE_KIND }
+  }
+}
+
+/** Live 会话 agent 的运行时形态（dsh-agent 公开类型较薄，用结构类型）。 */
+export interface LiveAgentLike {
+  readonly id: string
+  readonly status: 'running' | 'idle'
+  readonly session: Session
+  readonly options?: { provider?: string; model?: string; reasoningEffort?: string }
+  followup(message: unknown): void
+  steer(message: unknown): void
+  inject?(message: unknown): void
+  send?(message: unknown, target: 'next-step' | 'next-turn', wakeup: boolean): void
+  runMaintenance?<T>(job: (signal: AbortSignal) => Promise<T>): Promise<T>
+  cancel(cause?: unknown, options?: { keepInbox?: boolean }): void
+  whenIdle?(): Promise<void>
+  readonly ctx: Context
+  readonly inbox?: {
+    // dsh 0.1.2 及之前：`hasPending` getter；dsh 0.1.5 起已删除，仅有
+    // nextTurn / nextStep 只读数组（Inbox 成为 driver 持有的接口）。
+    remove?(messageId: string): boolean
+    hasPending?: boolean
+    nextTurn?: readonly unknown[]
+    nextStep?: readonly unknown[]
+  }
+}
+
+export interface BridgeMessageRow {
+  seq: number
+  time: number
+  role: 'user' | 'assistant'
+  text?: string
+  reasoning?: string
+  images: number
+  toolCalls?: string[]
+}
+
+export interface BridgeWaitResult {
+  message: BridgeMessageRow | null
+  seq: number
+  turnEnded: boolean
+  timedOut: boolean
+  /**
+   * true = 返回的是等待开始前就已经存在的输出（整个等待窗口内没有出现新的文本
+   * 回复 / 新段落）。此时 message 仍带正文，调用方据此区分"等到了新回复"与
+   * "拿到的是既有回复"。不变式：stale === (message !== null && message.seq <= baselineSeq)。
+   */
+  stale: boolean
+  aborted: boolean
+  waitedMs: number
+}
+
+export interface BridgeFindItem {
+  sessionId: string
+  title?: string
+  cwd?: string
+  workspaceId?: string
+  live: boolean
+  running?: boolean
+  parentSession?: string
+  origin?: 'subagent'
+  createdAt?: number
+  updatedAt?: number
+  agentPreset?: string
+}
+
+/**
+ * 兼容读取不同 dsh-session 版本上的会话事件：
+ * - 旧版 \`Session\` 暴露 \`get events(): readonly SessionEvent[]\`；
+ * - 新版将 \`get events\` 改为 \`snapshotEvents(fromSeq?, toSeqExclusive?)\` 方法——
+ *   \`.events\` 直接读取会得到 \`undefined\`，对 for...of 迭代即抛
+ *   \`events is not iterable\`。
+ * 两者都读不到（或 session 不存在）时回退为空数组，绝不抛迭代错误。
+ *
+ * 注意：dsh 0.1.6-alpha.1 起 \`snapshotEvents()\`（连同 \`eventAt()\` /
+ * \`ownEvents()\`）已标记 @deprecated —— 官方策略是"现有逻辑可暂不迁移，但禁止
+ * 新增调用"；其替代不是同步读，而是（a）恢复后读取 Session 投影/派生状态，或
+ * （b）按需异步分页读取历史窗口（见 dsh 决策
+ * 2026-09-09-deprecate-synchronous-session-event-reads）。本函数的调用方
+ * （foldMessages / segmentsSince / wait 基线）仍依赖完整同步快照，故按该决定暂缓
+ * 迁移；将来官方补齐分页读后，只需改造这一个入口。
+ */
+export function sessionEvents(session: unknown): readonly SessionEvent[] {
+  const s = session as {
+    events?: readonly SessionEvent[]
+    snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly SessionEvent[]
+  } | null | undefined
+  if (s === null || s === undefined) return []
+  if (Array.isArray(s.events)) return s.events
+  if (typeof s.snapshotEvents === 'function') {
+    try { return s.snapshotEvents() } catch { return [] }
+  }
+  return []
+}
+
+/** 规约任意"事件列表"值为数组（非数组 → []），避免 events is not iterable。 */
+export function asEventList(events: unknown): readonly SessionEvent[] {
+  return Array.isArray(events) ? events : []
+}
+
+/**
+ * 读取一个持久化（离线）会话的事件日志与头部元数据。兼容两代 persistence API：
+ * - 旧版：`sessionPersistence.inspect(id)` 直接返回 { events, meta }；
+ * - dsh 0.1.5 之后：`inspect` 已删除，改用 `open(id, 'read')` → `handle.read()`
+ *   （+ `handle.header`），读句柄不抢写所有权，读后必须 close()。
+ * 会话不存在时两个 API 都抛错，调用方按原语义处理。
+ * DSH 0.1.7 的持久化层在 open/read 时准备 V3→V4 迁移，可能补入
+ * interrupted turn/end 并重新编号。始终消费返回的逻辑事件，不读取物理 JSONL。
+ */
+export async function inspectPersistedSession(ctx: Context, id: string): Promise<{ events: readonly SessionEvent[]; meta: { cwd?: string } }> {
+  const persistence = ctx.sessionPersistence as unknown as {
+    inspect?: (sid: string) => Promise<{ events: readonly SessionEvent[]; meta: { cwd?: string } }>
+    open?: (sid: string, access: 'read') => Promise<{
+      header: { cwd?: string }
+      read(): Promise<{ events: readonly SessionEvent[] }>
+      close(): Promise<void>
+    }>
+  }
+  if (typeof persistence.inspect === 'function') {
+    return await persistence.inspect(id)
+  }
+  const handle = await persistence.open!(id, 'read')
+  try {
+    const { events } = await handle.read()
+    return { events, meta: handle.header }
+  } finally {
+    await handle.close()
+  }
+}
+
+/** 插件任务/监控输入使用独立来源，不能伪装新的人工授权。 */
+export function userMessage(text: string): unknown {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: AUTOMATION_SOURCE_KIND },
+  }
+}
+
+/** 跨会话投递的消息来源类型（来源标识的 kind）。 */
+export const SOURCE_KIND = 'session-message' as const
+
+/**
+ * 跨会话投递的身份（issue #3）：谁发的、这条消息的标识、可选回复给哪条。
+ * messageId 是这条消息的身份；重试去重由调用方（客户端）的请求标识负责。
+ */
+export interface SourceIdentity {
+  senderSessionId: string
+  messageId: string
+  replyTo?: string
+  /** 因果链的根消息 id 与本条消息的跳数（防环，见 hop.ts）：只进 source，不进正文。 */
+  rootMessageId?: string
+  hopCount?: number
+  /** 发送方会话标题，仅用于让首行可读；没有就只显示 id。 */
+  senderLabel?: string
+  replyHandling?: 'receive-only'
+  purpose?: 'information'
+}
+
+/** 压成单行：折叠空白、去掉控制字符、超长截断。 */
+function oneLine(value: string, limit: number): string {
+  const flat = value.replace(/\s+/g, ' ').replace(/[\u0000-\u001f\u007f]/g, '').trim()
+  return flat.length > limit ? flat.slice(0, limit) + '…' : flat
+}
+
+/** 跨会话消息的正文首行（来源 + 回信地址）。 */
+export function formatSourceLine(identity: SourceIdentity): string {
+  const id = oneLine(identity.senderSessionId, 120) || '未知会话'
+  const label = identity.senderLabel === undefined ? '' : oneLine(identity.senderLabel, 40)
+  const who = label === '' ? id : `「${label}」(${id})`
+  return `来自会话 ${who} · ${identity.purpose === 'information' ? '信息' : identity.replyTo === undefined ? '回信请发给它' : '回信'}`
+}
+
+/** 跨会话投递的消息值：正文带来源首行，来源标识记在 source 上。 */
+export function sourceIdentityMessage(text: string, identity: SourceIdentity, originalRequest?: string, originalRequestOrigin?: 'human-command' | 'model-tool'): {
+  id: MessageId
+  role: 'user'
+  content: Array<{ type: 'text'; text: string }>
+  source: { kind: typeof SOURCE_KIND; senderSessionId: string; messageId: string; replyTo?: string; rootMessageId?: string; hopCount?: number; replyHandling?: 'receive-only'; purpose?: 'information' }
+} {
+  const receiveOnly = identity.replyHandling === 'receive-only'
+  const resultContext = receiveOnly
+    ? { version: 5, replyTo: identity.replyTo, originalRequest, automaticSend: false, purpose: 'result-context', originalRequestOrigin, replyHandling: 'receive-only' }
+    : originalRequestOrigin === undefined
+    ? { version: 3, replyTo: identity.replyTo, originalRequest, automaticSend: false, purpose: 'result-context', currentAction: '向当前用户呈现下方针对原请求的业务结果' }
+    : { version: 4, replyTo: identity.replyTo, originalRequest, automaticSend: false, purpose: 'result-context', originalRequestOrigin }
+  const resultPrefix = receiveOnly ? '[协作回信上下文：仅收信；下方结果保留供当前或后续用户任务使用，不单独要求总结。原请求记录（JSON数据）：'
+    : originalRequestOrigin === undefined ? '[内部回信上下文 '
+    : '[当前协作交付：' + (originalRequestOrigin === 'human-command' ? '用户此前已通过人工发送入口发起原请求。' : '原会话此前已通过工具发起协作请求。') +
+      '请现在向本会话用户交付该请求所需的业务结果。原请求记录（JSON数据）：'
+  return {
+    id: MessageId(identity.messageId),
+    role: 'user',
+    content: [{ type: 'text', text: `${formatSourceLine(identity)}\n${identity.purpose === 'information'
+      ? '[协作信息：仅作为相关工作的上下文，不要求回信，不新增任务或授权。]'
+      : identity.replyTo === undefined
+      ? `[协作任务 messageId=${identity.messageId}；请处理下方任务并用 session_coordinator_send 向来源交付结果，replyTo=${identity.messageId}。]`
+      : originalRequest === undefined
+        ? `[内部执行说明，无需复述：会话回信 replyTo=${identity.replyTo}；后续自动发送权限=无。正文是协作交付结果。本次答复请直接给出正文的业务结论或实际业务限制，不汇报本说明的执行情况。]`
+        : `${resultPrefix}${JSON.stringify(resultContext)}]`}\n${text}` }],
+    source: {
+      kind: SOURCE_KIND,
+      senderSessionId: identity.senderSessionId,
+      messageId: identity.messageId,
+      ...(identity.replyTo === undefined || identity.replyTo === '' ? {} : { replyTo: identity.replyTo }),
+      ...(identity.rootMessageId === undefined ? {} : { rootMessageId: identity.rootMessageId }),
+      ...(identity.hopCount === undefined ? {} : { hopCount: identity.hopCount }),
+      ...(receiveOnly ? { replyHandling: 'receive-only' as const } : {}),
+      ...(identity.purpose === 'information' ? { purpose: 'information' as const } : {}),
+    },
+  }
+}
+
+/**
+ * 用户可见的输入来源：人工、跨会话投递或插件自动任务/监控。
+ * 读取路径（read / wait / segments / 标题回退）用这个判定，别写死 'user'。
+ */
+export function isUserFacingSource(kind: string | undefined): boolean {
+  return kind === undefined || kind === 'user' || kind === SOURCE_KIND || kind === 'session-collaboration' || kind === AUTOMATION_SOURCE_KIND
+}
+
+function blockText(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  const parts: string[] = []
+  for (const raw of content) {
+    const block = raw as { type?: unknown; text?: unknown } | null
+    if (block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+      if (block.text !== '') parts.push(block.text)
+    }
+  }
+  return parts.length === 0 ? undefined : parts.join('\n')
+}
+
+/** 提取指定类型的 content block 文本（如 reasoning），用于从消息 content 里读出思维链。 */
+function blockTextByType(content: unknown, wantedType: string): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  const parts: string[] = []
+  for (const raw of content) {
+    const block = raw as { type?: unknown; text?: unknown } | null
+    if (block !== null && typeof block === 'object' && block.type === wantedType && typeof block.text === 'string') {
+      if (block.text !== '') parts.push(block.text)
+    }
+  }
+  return parts.length === 0 ? undefined : parts.join('\n')
+}
+
+function countImages(content: unknown): number {
+  if (!Array.isArray(content)) return 0
+  let n = 0
+  for (const raw of content) {
+    const block = raw as { type?: unknown } | null
+    if (block !== null && typeof block === 'object' && block.type === 'image') n += 1
+  }
+  return n
+}
+
+function toolNamesOf(toolCalls: unknown): string[] {
+  if (!Array.isArray(toolCalls)) return []
+  const names: string[] = []
+  for (const raw of toolCalls) {
+    const call = raw as { name?: unknown } | null
+    if (call !== null && typeof call === 'object' && typeof call.name === 'string' && !names.includes(call.name)) names.push(call.name)
+  }
+  return names
+}
+
+/** 折叠会话事件日志为可读消息行（跳过非 user 来源与空消息）。 */
+export function foldMessages(events: readonly SessionEvent[]): BridgeMessageRow[] {
+  const list = asEventList(events)
+  const rows: BridgeMessageRow[] = []
+  for (const event of list) {
+    if (event.type === 'user/message') {
+      const source = (event.data as { source?: { kind?: string } }).source
+      if (!isUserFacingSource(source?.kind)) continue
+      const text = blockText(event.data.content)
+      if (text === undefined) continue
+      rows.push({ seq: event.seq, time: event.time, role: 'user', text, images: countImages(event.data.content) })
+    } else if (event.type === 'assistant/message') {
+      const message = event.data.message as { content?: unknown; reasoning?: unknown; toolCalls?: unknown } | null
+      const text = message === null ? undefined : blockText(message.content)
+      // 思维链是 content 里 type:'reasoning' 的块；老版本曾把取舍放在 message.reasoning 字段，
+      // 两者都读，优先 content 块（当前 dsh-llm 的 AssistantMessage 无独立 reasoning 字段）。
+      const reasoning = message === null ? undefined : (blockTextByType(message.content, 'reasoning') ?? blockText(message.reasoning))
+      const images = message === null ? 0 : countImages(message.content)
+      const toolCalls = message === null ? [] : toolNamesOf(message.toolCalls)
+      if (text === undefined && reasoning === undefined && toolCalls.length === 0) continue
+      const row: BridgeMessageRow = { seq: event.seq, time: event.time, role: 'assistant', images }
+      if (text !== undefined) row.text = text
+      if (reasoning !== undefined) row.reasoning = reasoning
+      if (toolCalls.length > 0) row.toolCalls = toolCalls
+      rows.push(row)
+    }
+  }
+  return rows
+}
+
+/** 一个已完成的输出段落：一次 assistant step 定型的 assistant/message（turn 中途即可读，无需等整个 turn）。 */
+export interface BridgeSegment {
+  seq: number
+  time: number
+  turn: number
+  step: number
+  text?: string
+  reasoning?: string
+  toolCalls: string[]
+  openTurn: boolean
+}
+
+/** 按已完成输出段落折叠事件日志：每个 assistant/message 割一段，返回 sinceSeq 后的所有段落（事件序）。 */
+export function segmentsSince(events: readonly SessionEvent[], sinceSeq = 0): BridgeSegment[] {
+  const list = asEventList(events)
+  const out: BridgeSegment[] = []
+  let openTurn = false
+  for (const event of list) {
+    if (event.type === 'turn/start') { openTurn = true; continue }
+    if (event.type === 'turn/end') { openTurn = false; continue }
+    if (event.type !== 'assistant/message') continue
+    if (event.seq <= sinceSeq) continue
+    const message = event.data.message as { content?: unknown; reasoning?: unknown; toolCalls?: unknown } | null
+    const text = message === null ? undefined : blockText(message.content)
+    const reasoning = message === null ? undefined : (blockTextByType(message.content, 'reasoning') ?? blockText(message.reasoning))
+    const toolCalls = message === null ? [] : toolNamesOf(message.toolCalls)
+    const turn = (event.data as { turn?: unknown })?.turn
+    const step = (event.data as { step?: unknown })?.step
+    const seg: BridgeSegment = {
+      seq: event.seq,
+      time: event.time,
+      turn: typeof turn === 'number' ? turn : 0,
+      step: typeof step === 'number' ? step : 0,
+      toolCalls,
+      openTurn,
+    }
+    if (text !== undefined) seg.text = text
+    if (reasoning !== undefined) seg.reasoning = reasoning
+    out.push(seg)
+  }
+  return out
+}
+
+/** 取自 sinceSeq 之后最新一个已完成输出段落（无则 null）。 */
+export function latestSegmentSince(events: readonly SessionEvent[], sinceSeq = 0): BridgeSegment | null {
+  const segs = segmentsSince(events, sinceSeq)
+  return segs.length === 0 ? null : (segs[segs.length - 1] ?? null)
+}
+
+/** 实时思维链切片：一个 live 会话当前"进行中"的增量推理与文本。 */
+export interface CoTLiveSlice {
+  /** 产生该推理的 turn。 */
+  turn: number
+  /** 产生该推理的 step。 */
+  step: number
+  /** 自最近一条已定型 assistant 消息以来累积的进行中推理文本（reasoning-delta 拼接）。 */
+  reasoning: string
+  /** 同窗口累积的进行中文本增量（text-delta 拼接）。 */
+  text: string
+  /** 本切片覆盖到的最大事件 seq（供增量轮询记住游标）。 */
+  seq: number
+  /** 最近一次事件时间戳。 */
+  time: number
+}
+
+/**
+ * 对一个 live 会话的事件日志折叠出其"最近推理/文本增量流"。兼容两代日志形状：
+ * - dsh 0.1.5 之后：turn 内不再发布独立 chunk 事件，流式增量内嵌在已定型
+ *   assistant/message（或未定型 assistant/attempt）事件的 `stream` 记录里
+ *   （reasoning-chunks / text-chunks 批量段 + 原始 chunk：reasoning-delta / text-delta）；
+ * - 0.1.2-rc 之前：独立的 assistant/chunk 事件（turn 中途即可见、增量，
+ *   这正是旧版监控思维链并按规则提前终止所需的粒度）。
+ * 两者兼读、取最新一份；无任何增量（会话空闲、或该 provider 不流式推理/无推理）
+ * 返回 null，调用方应回落为 foldMessages 里已定型的 message.reasoning。
+ * 纯读、无副作用；事件形状不做任何假设，缺失/异常一律安全处理。
+ */
+export function liveReasoningSnapshot(events: readonly SessionEvent[]): CoTLiveSlice | null {
+  const list = asEventList(events)
+  // 旧格式只累积"最近一条已定型 assistant/message 之后"的流式增量（in-flight 窗口）；
+  // 新格式的 stream 随定型事件落地，直接以最新携带 stream 的事件为准。
+  let lastFinalizedSeq = -1
+  let reasoning = ''
+  let text = ''
+  let seq = -1
+  let time = 0
+  let turn = 0
+  let step = 0
+  let foundDelta = false
+  for (const event of list) {
+    const type = event.type as string
+    if (type === 'assistant/message' || type === 'assistant/attempt') {
+      const data = event.data as { turn?: unknown; step?: unknown; stream?: unknown } | null | undefined
+      if (data !== null && data !== undefined && typeof data === 'object' && Array.isArray(data.stream)) {
+        let r = ''
+        let t = ''
+        for (const raw of data.stream as unknown[]) {
+          const record = raw as { type?: unknown; texts?: unknown; text?: unknown; chunk?: unknown } | null
+          if (record === null || typeof record !== 'object') continue
+          if (record.type === 'reasoning-chunks' && Array.isArray(record.texts)) {
+            for (const s of record.texts as unknown[]) if (typeof s === 'string') r += s
+          } else if (record.type === 'text-chunks' && Array.isArray(record.texts)) {
+            for (const s of record.texts as unknown[]) if (typeof s === 'string') t += s
+          } else if (record.type === 'chunk') {
+            const c = record.chunk as { type?: unknown; text?: unknown } | null
+            if (c !== null && typeof c === 'object' && typeof c.type === 'string' && typeof c.text === 'string') {
+              if (c.type === 'reasoning-delta') r += c.text
+              else if (c.type === 'text-delta') t += c.text
+            }
+          }
+        }
+        if (r !== '' || t !== '') {
+          if (typeof data.turn === 'number') turn = data.turn
+          if (typeof data.step === 'number') step = data.step
+          reasoning = r
+          text = t
+          seq = event.seq
+          time = event.time
+          foundDelta = true
+        }
+      }
+      if (type === 'assistant/message') lastFinalizedSeq = event.seq
+      continue
+    }
+    // 旧格式：独立 assistant/chunk 事件。
+    if (type !== 'assistant/chunk') continue
+    if (event.seq <= lastFinalizedSeq) continue
+    const data = event.data as { turn?: unknown; step?: unknown; chunk?: unknown } | null | undefined
+    if (data === null || data === undefined || typeof data !== 'object') continue
+    const c = data.chunk as { type?: unknown; text?: unknown } | null
+    if (c === null || typeof c !== 'object' || typeof c.type !== 'string') continue
+    if (c.type === 'reasoning-delta' || c.type === 'text-delta') {
+      if (typeof c.text !== 'string') continue
+      if (c.type === 'reasoning-delta') reasoning += c.text
+      else text += c.text
+      if (typeof data.turn === 'number') turn = data.turn
+      if (typeof data.step === 'number') step = data.step
+      foundDelta = true
+      if (event.seq > seq) seq = event.seq
+      if (event.time > time) time = event.time
+    }
+  }
+  if (!foundDelta) return null
+  return { turn, step, reasoning, text, seq, time }
+}
+
+/** 思维链尾巴默认截断上限（字符）。 */
+export const REASONING_TAIL_LIMIT = 4000
+
+/**
+ * 组装一条受字符上限约束的"思维链尾巴"用于展示/摘要：
+ * 优先进行中的 liveReasoning，否则最近已定型的 lastReasoning；
+ * 超出上限时截断并附省略标记。两者皆无返回 undefined。
+ */
+export function reasoningTailOf(liveReasoning: string | undefined, lastReasoning: string | undefined, limit = REASONING_TAIL_LIMIT): string | undefined {
+  const source = liveReasoning ?? lastReasoning
+  if (source === undefined || source === '') return undefined
+  if (source.length <= limit) return source
+  return source.slice(0, limit) + '…'
+}
+
+/**
+ * 会话标题：优先 session/title 事件（last-wins，与 UI 一致）；
+ * 无标题事件时回落为第一条用户消息（截断 80 字符）。
+ */
+export function titleOf(events: readonly SessionEvent[]): string | undefined {
+  const list = asEventList(events)
+  let title: string | undefined
+  for (const event of list) {
+    const raw = event as unknown as { type: string; data: { title?: unknown } }
+    if (raw.type === 'session/title') {
+      const t = raw.data.title
+      if (typeof t === 'string' && t !== '') title = t
+    }
+  }
+  if (title !== undefined) return title
+  for (const event of list) {
+    if (event.type === 'user/message') {
+      const source = (event.data as { source?: { kind?: string } }).source
+      if (!isUserFacingSource(source?.kind)) continue
+      const text = blockText(event.data.content)
+      if (text !== undefined) {
+        const trimmed = text.replace(/\s+/g, ' ').trim()
+        return trimmed.length > 80 ? trimmed.slice(0, 80) + '…' : trimmed
+      }
+    }
+  }
+  return undefined
+}
+
+/** 日志最大事件序号。 */
+export function maxSeq(events: readonly SessionEvent[]): number {
+  const list = asEventList(events)
+  let m = -1
+  for (const event of list) if (event.seq > m) m = event.seq
+  return m
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+export interface WaitForReplyOptions {
+  session: Session
+  baselineSeq: number
+  timeoutMs: number
+  signal?: AbortSignal
+  requireTurnEnd?: boolean
+  /** true 时等待到 baseline 之后出现一个“新完成的输出段落”（assistant/message），立即返回该段，不等整个 turn。 */
+  waitForSegment?: boolean
+}
+
+/**
+ * 轮询等待某会话在 baseline 之后出现新的 assistant 回复。
+ *
+ * 完成条件默认是"出现一条带文本的新 assistant 回复"（即回复可读），而不是
+ * 等待 turn/end。实测发现 bridge 通过 agent.followup() 驱动的 turn 在事件流里
+ * 不保证产生 turn/end（会一直等满超时），导致"回复早就有了、读取却要等十几二十秒"。
+ * 因此默认不再用 turn/end 作门控；需要完整收尾语义时用 requireTurnEnd:true 显式开启，
+ * 此时才会等到其后出现 turn/end。
+ *
+ * 返回的 message：默认是 baseline 之后最新的一条**带文本** assistant 行；整个等待
+ * 窗口内没有等到新文本回复时，回落为 baseline 及之前最新的一条带文本回复并置
+ * stale:true（绝不把更晚的无文本中间行当回复返回 —— 那正是渲染层打印 "(no text)"
+ * 的来源）。segment 模式同理：新段落优先，否则回落既有段落。
+ * 超时/中止返回已收集内容；timedOut 表示"本次等待要求的输出未在预算内出现"。
+ */
+export async function waitForReply(opts: WaitForReplyOptions): Promise<BridgeWaitResult> {
+  const started = Date.now()
+  const deadline = started + opts.timeoutMs
+  const requireTurnEnd = opts.requireTurnEnd ?? false
+  const waitForSegment = opts.waitForSegment ?? false
+  let latest: BridgeMessageRow | null = null
+  let textReply: BridgeMessageRow | null = null
+  let segment: BridgeSegment | null = null
+  let turnEnded = false
+  for (;;) {
+    if (opts.signal !== undefined && opts.signal.aborted) break
+    const events = sessionEvents(opts.session)
+    for (const row of foldMessages(events)) {
+      if (row.seq <= opts.baselineSeq || row.role !== 'assistant') continue
+      if (latest === null || row.seq > latest.seq) latest = row
+      if (row.text !== undefined && (textReply === null || row.seq > textReply.seq)) textReply = row
+    }
+    if (waitForSegment) {
+      const seg = latestSegmentSince(events, opts.baselineSeq)
+      if (seg !== null && (segment === null || seg.seq > segment.seq)) segment = seg
+    }
+    if (requireTurnEnd && latest !== null) {
+      for (const event of events) {
+        if (event.seq > latest.seq && event.type === 'turn/end') { turnEnded = true; break }
+      }
+    }
+    let done: boolean
+    if (requireTurnEnd) done = latest !== null && turnEnded
+    else if (waitForSegment) done = segment !== null
+    else done = textReply !== null
+    if (done) break
+    if (Date.now() >= deadline) break
+    await sleep(100)
+  }
+  // 等待窗口内是否观察到新输出（即 done 条件是否达成）：用于 timedOut / stale 判定。
+  const observedNew = waitForSegment ? segment !== null : textReply !== null
+  const sawNewRow = latest !== null
+  // 零新输出时回落既有内容；回落扫描限定 seq <= baselineSeq，保证 stale 不变式成立，
+  // 也不会把"其实算新"的内容标成 stale。
+  let stale = false
+  if (waitForSegment) {
+    if (segment === null) {
+      const prev = lastSegmentUpTo(sessionEvents(opts.session), opts.baselineSeq)
+      if (prev !== null) { segment = prev; stale = true }
+    }
+  } else if (textReply === null) {
+    const prev = lastTextRowUpTo(foldMessages(sessionEvents(opts.session)), opts.baselineSeq)
+    if (prev !== null) { textReply = prev; stale = true }
+  }
+  // 段落模式返回该段（把 reasoning 并进返回行，便于“按段落读思维链”）；否则返回最新文本行。
+  const message: BridgeMessageRow | null = waitForSegment && segment !== null ? {
+    seq: segment.seq, time: segment.time, role: 'assistant', images: 0,
+    ...(segment.text !== undefined ? { text: segment.text } : {}),
+    ...(segment.reasoning !== undefined ? { reasoning: segment.reasoning } : {}),
+    ...(segment.toolCalls.length > 0 ? { toolCalls: segment.toolCalls } : {}),
+  } : textReply
+  return {
+    message,
+    seq: message === null ? opts.baselineSeq : message.seq,
+    turnEnded,
+    // done 条件未达成即超时。requireTurnEnd 下"连新行都没出现"同样算超时
+    // （旧写法 latest !== null && !turnEnded 会把这种情况误报为未超时）。
+    timedOut: requireTurnEnd ? !(sawNewRow && turnEnded) : !observedNew,
+    stale,
+    aborted: opts.signal !== undefined && opts.signal.aborted,
+    waitedMs: Date.now() - started,
+  }
+}
+
+/** seq 及之前最新一个已完成输出段落（wait 零新输出时回落既有段落）。 */
+function lastSegmentUpTo(events: readonly SessionEvent[], seq: number): BridgeSegment | null {
+  const segs = segmentsSince(events)
+  for (let i = segs.length - 1; i >= 0; i -= 1) {
+    const seg = segs[i]
+    if (seg !== undefined && seg.seq <= seq) return seg
+  }
+  return null
+}
+
+/** seq 及之前最新一条带文本的 assistant 行（wait 零新文本回复时回落既有回复）。 */
+function lastTextRowUpTo(rows: readonly BridgeMessageRow[], seq: number): BridgeMessageRow | null {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i]
+    if (row !== undefined && row.role === 'assistant' && row.text !== undefined && row.seq <= seq) return row
+  }
+  return null
+}
+
+export interface TargetCwdArgs {
+  workspaceId?: string
+  cwd?: string
+}
+
+/**
+ * 解析目标工作目录：workspaceId（注册表）> cwd（绝对路径/任意拼写）> 调用者会话 cwd。
+ * 跨工作区由 workspaceId / cwd 任意指定实现。
+ */
+export async function resolveTargetCwd(ctx: Context, callerCwd: string | undefined, args: TargetCwdArgs): Promise<string> {
+  if (typeof args.workspaceId === 'string' && args.workspaceId !== '') {
+    const ws = ctx.workspaceRegistry.get(WorkspaceId(args.workspaceId))
+    if (ws === undefined) throw new Error(`workspace not found: ${args.workspaceId}`)
+    return ws.path
+  }
+  if (typeof args.cwd === 'string' && args.cwd.trim() !== '') return args.cwd.trim()
+  if (callerCwd !== undefined && callerCwd !== '') return callerCwd
+  throw new Error('cannot determine target working directory: pass cwd or workspaceId')
+}
+
+/** 会话 id → workspace id（遍历注册表反查，跨全部工作区）。 */
+export function workspaceBySession(ctx: Context): ReadonlyMap<string, string> {
+  const map = new Map<string, string>()
+  for (const ws of ctx.workspaceRegistry.list()) {
+    for (const sessionId of ws.sessionIds) map.set(sessionId, String(ws.id))
+  }
+  return map
+}
+
+/** 会话 cwd → workspace id（按路径匹配；无则 undefined）。 */
+export function workspaceByPath(ctx: Context, cwd: string | undefined): string | undefined {
+  if (cwd === undefined) return undefined
+  for (const ws of ctx.workspaceRegistry.list()) {
+    if (ws.path === cwd) return ws.id
+  }
+  return undefined
+}
+
+/**
+ * 将会话计入其 cwd 所属的 workspace（镜像 session-controller 的 create /
+ * fork 记账：它们创建代理后都会调用 workspace.attachSession）。没有这一步，
+ * bridge 直建的新会话不会出现在任何 workspace 组，而是落到 UI 的"未分组"。
+ * cwd 无可校验 workspace 时（目录未登记/无法解析）返回 undefined，会话保持
+ * 未分组，与 workspace 的既有语义一致；attach 失败只告警、不阻断会话本身。
+ * @returns 会话所属 workspace id，无可归属时 undefined。
+ */
+export async function attachSessionToWorkspace(ctx: Context, sessionId: SessionId, cwd: string | undefined): Promise<string | undefined> {
+  if (cwd === undefined || cwd === '') return undefined
+  let workspace: Workspace | undefined
+  try {
+    workspace = await ctx.workspaceRegistry.resolveByPath(cwd)
+  } catch {
+    workspace = undefined
+  }
+  if (workspace === undefined) return undefined
+  try {
+    await workspace.attachSession(sessionId)
+  } catch (error) {
+    console.warn(
+      `[dsh-session-coordinator] failed to attach session '${sessionId}' to workspace '${workspace.id}': `
+      + (error instanceof Error ? error.message : String(error)),
+    )
+    return undefined
+  }
+  return workspace.id
+}
+
+/**
+ * 卡住判定（唯一真源，status 渲染与监控 watchdog 共用）：只有 **running** 会话才可能
+ * "卡住" —— 空闲/已收尾的会话没有进展是正常状态，不能报 stall。阈值语义为"超过"
+ * （严格大于），与工具描述/README 的 "more than stalledMs" 一致。
+ */
+export function isStalled(running: 'running' | 'idle', stalledMs: number | null, thresholdMs: number): boolean {
+  return running === 'running' && stalledMs !== null && stalledMs > thresholdMs
+}
+
+/** 一次会话监控快照：供"监控线程"判断主任务是否在跑、有无进展、是否卡住。 */
+export interface BridgeStatusSnapshot {
+  sessionId: string
+  live: boolean
+  running: 'running' | 'idle'
+  title?: string
+  cwd?: string
+  workspaceId?: string
+  /** 是否有未闭合的 turn（agent 正在处理一轮）。 */
+  openTurn: boolean
+  /** 最新 turn 编号（0 = 尚未开始第一轮）。 */
+  lastTurn: number
+  /** 最近一次事件时间戳（无事件为 null）；用于卡住检测。 */
+  lastActivityAt: number | null
+  /** 距最近一次事件已过去多少毫秒（now - lastActivityAt）。 */
+  stalledMs: number | null
+  /** 是否有待处理输入（inbox 排队中的消息）。 */
+  pendingWork: boolean
+  nextTurnCount: number
+  nextStepCount: number
+  /** 最新一条带文本的 assistant 回复。 */
+  lastAssistantText?: string
+  /** 最新一条已定型 assistant 消息的推理（reasoning content block）。 */
+  lastReasoning?: string
+  /** 进行中的实时思维链增量（reasoning-delta 拼接；无进行中流时为 undefined）。 */
+  liveReasoning?: string
+  /** 极紧凑的思维链尾巴：liveReasoning 优先、否则 lastReasoning，截断至 reasoningTailLimit。 */
+  reasoningTail?: string
+  /** 折叠后的消息总数。 */
+  messageCount: number
+  /** 最近几条消息（默认 8）。 */
+  recent: BridgeMessageRow[]
+}
+
+/**
+ * 计算一个 live 会话的监控快照（agent 状态 + 事件折叠出的进度/卡住事实）。
+ * 纯读，无副作用。用于 `session_coordinator_status`。
+ */
+export function statusSnapshot(ctx: Context, agent: LiveAgentLike): BridgeStatusSnapshot {
+  const events = sessionEvents(agent.session)
+  const rows = foldMessages(events)
+  let lastActivityAt: number | null = null
+  let lastTurn = 0
+  let openTurn = false
+  for (const event of events) {
+    if (event.type === 'turn/start' || event.type === 'turn/end') {
+      const turn = (event.data as { turn?: number } | null)?.turn
+      if (typeof turn === 'number' && turn > 0) lastTurn = turn
+    }
+    if (event.type === 'turn/start') openTurn = true
+    if (event.type === 'turn/end') openTurn = false
+    if (event.time > (lastActivityAt ?? 0)) lastActivityAt = event.time
+  }
+  const recent = rows.slice(-8)
+  let lastAssistantText: string | undefined
+  let lastReasoning: string | undefined
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i]
+    if (row !== undefined && row.role === 'assistant') {
+      if (lastAssistantText === undefined && row.text !== undefined) lastAssistantText = row.text
+      if (lastReasoning === undefined && row.reasoning !== undefined) lastReasoning = row.reasoning
+      if (lastAssistantText !== undefined && lastReasoning !== undefined) break
+    }
+  }
+  const live = liveReasoningSnapshot(events)
+  const liveReasoning = live !== null && live.reasoning !== '' ? live.reasoning : undefined
+  const reasoningTail = reasoningTailOf(liveReasoning, lastReasoning)
+  const inbox = agent.inbox
+  const cwd = agent.session.header.cwd
+  return {
+    sessionId: agent.id,
+    live: true,
+    running: agent.status,
+    title: titleOf(events),
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(workspaceByPath(ctx, cwd) === undefined ? {} : { workspaceId: workspaceByPath(ctx, cwd) }),
+    openTurn,
+    lastTurn,
+    lastActivityAt,
+    stalledMs: lastActivityAt === null ? null : Date.now() - lastActivityAt,
+    // 双兼容：0.1.2 用 hasPending getter；0.1.5 起只有 nextTurn/nextStep 数组。
+    pendingWork: inbox?.hasPending === true || (inbox?.nextTurn?.length ?? 0) + (inbox?.nextStep?.length ?? 0) > 0,
+    nextTurnCount: inbox?.nextTurn?.length ?? 0,
+    nextStepCount: inbox?.nextStep?.length ?? 0,
+    ...(lastAssistantText === undefined ? {} : { lastAssistantText }),
+    ...(lastReasoning === undefined ? {} : { lastReasoning }),
+    ...(liveReasoning === undefined ? {} : { liveReasoning }),
+    ...(reasoningTail === undefined ? {} : { reasoningTail }),
+    messageCount: rows.length,
+    recent,
+  }
+}
+
+/**
+ * 组装 `session_coordinator_archived` 的返回条目：只有当标题确实解析出来时才带上
+ * `title` 字段。显式写入 `title: undefined` 会让工具返回值不再是 lossless JSON，
+ * 宿主会因此拒绝**整个**工具结果（真实事故：归档集合里存在"无用户消息 / 无
+ * session/title 事件"的会话时，`resolveTitles: true` 必然报
+ * `value is not lossless JSON`）。标题缺失只是信息缺失，不应让工具整体失败。
+ */
+export function archivedEntries(
+  ids: readonly string[],
+  titles: ReadonlyMap<string, string | undefined>,
+): Array<{ sessionId: string; title?: string }> {
+  return ids.map((sessionId) => {
+    const title = titles.get(sessionId)
+    return title === undefined || title === '' ? { sessionId } : { sessionId, title }
+  })
+}
+
+/** 取 live agent（跨工具/监控共用）。不存在返回 undefined。 */
+export function getLiveAgent(ctx: Context, sessionId: string): LiveAgentLike | undefined {
+  const agents = ctx.agents as unknown as { get(id: string): LiveAgentLike | undefined }
+  return agents.get(sessionId)
+}
+
+/** 对 live 会话发送一条用户消息（queue=追加一轮，steer=打断当前步注入）。 */
+export function deliverToAgent(agent: LiveAgentLike, message: unknown, mode: 'queue' | 'steer'): void {
+  if (mode === 'steer') agent.steer(message)
+  else agent.followup(message)
+}
+
+/** 对 live 会话发送一条用户消息（queue=追加一轮，steer=下一步边界注入）。 */
+export function sendLiveMessage(ctx: Context, sessionId: string, message: string, mode: 'queue' | 'steer'): boolean {
+  const agent = getLiveAgent(ctx, sessionId)
+  if (agent === undefined) return false
+  deliverToAgent(agent, userMessage(message), mode)
+  return true
+}
+
+/** 中止一个 live 会话的活动 turn（可保留队列输入）。返回是否发起了取消。 */
+export function cancelLiveSession(ctx: Context, sessionId: string, keepInbox: boolean, reason: string | undefined): boolean {
+  const agent = getLiveAgent(ctx, sessionId)
+  if (agent === undefined) return false
+  const cause = typeof reason === 'string' && reason.trim() !== ''
+    ? { kind: 'hook', reason: reason.trim() }
+    : { kind: 'user' }
+  agent.cancel(cause, { keepInbox })
+  return true
+}
+
+/**
+ * 目标会话是否是**顶层**会话（而不是某个 agent 派生的子代理）。
+ *
+ * 判据是 dsh-agent 的 `AgentRegistry.roots()`：它返回"创建时没有 owner"的 agent
+ * （`entry.owner === undefined`），其注释明确"durable session lineage 不影响该运行时
+ * 关系"。桥创建的会话与 UI 主会话都是顶层。
+ *
+ * 返回 undefined 表示**无法判定**（宿主没有 roots API，例如旧 harness 或测试桩）——
+ * 调用方应按顶层处理，保持旧行为，而不是改判成子代理。
+ */
+export function isRootAgent(ctx: Context, sessionId: string): boolean | undefined {
+  const agents = ctx.agents as unknown as { roots?: () => LiveAgentLike[] }
+  if (typeof agents.roots !== 'function') return undefined
+  try {
+    return agents.roots().some((agent) => agent.id === sessionId)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 收集某个会话**直接派生**的子代理快照（循环转移时的交接清单用）。
+ *
+ * 归属判定优先用 `AgentRegistry.isOwnedBy(id, owner)`（`store.get(id)?.owner === owner`，
+ * 精确到运行时父子关系，且"运行时归属与持久化谱系无关"）；宿主没有该方法时回落到
+ * session header 的 `parentSession`（持久化信息，重启后仍可读，但会把 fork 出来的
+ * 会话也算进来，故仅作兜底）。
+ *
+ * 只读；任何一步异常都不抛出——宁可少列一个子代理，也不能让转移流程失败。
+ */
+export function collectDescendants(ctx: Context, owner: LiveAgentLike): BridgeDescendantInfo[] {
+  const agents = ctx.agents as unknown as {
+    list?: () => LiveAgentLike[]
+    isOwnedBy?: (id: string, owner: LiveAgentLike) => boolean
+  }
+  let list: LiveAgentLike[]
+  try {
+    list = typeof agents.list === 'function' ? agents.list() : []
+  } catch {
+    return []
+  }
+  const owned: LiveAgentLike[] = []
+  for (const candidate of list) {
+    if (candidate === owner || candidate.id === owner.id) continue
+    if (typeof agents.isOwnedBy === 'function') {
+      let byOwner = false
+      try { byOwner = agents.isOwnedBy(candidate.id, owner) } catch { byOwner = false }
+      if (byOwner) owned.push(candidate)
+      continue
+    }
+    const lineage = candidate.session?.header as { parentSession?: string } | undefined
+    if (lineage?.parentSession === owner.id) owned.push(candidate)
+  }
+  return owned.map((child) => {
+    const header = child.session.header as { origin?: 'subagent'; delegationDepth?: number }
+    const task = firstUserText(foldMessages(sessionEvents(child.session)))
+    return {
+      id: child.id,
+      status: child.status,
+      running: child.status === 'running',
+      ...(header.origin === undefined ? {} : { origin: header.origin }),
+      ...(header.delegationDepth === undefined ? {} : { delegationDepth: header.delegationDepth }),
+      // 400 字符：够新会话认出这个子代理在做什么，又不让清单膨胀。
+      ...(task === undefined ? {} : { task: clipText(task, 400) }),
+    }
+  })
+}
+
+/** 截断到 limit 字符（超出加省略号）。 */
+function clipText(text: string, limit: number): string {
+  return text.length > limit ? text.slice(0, limit) + '…' : text
+}
+
+/** 事件日志里第一条用户指令（子代理领到的任务描述）。 */
+function firstUserText(rows: readonly BridgeMessageRow[]): string | undefined {
+  for (const row of rows) if (row.role === 'user' && row.text !== undefined) return row.text
+  return undefined
+}

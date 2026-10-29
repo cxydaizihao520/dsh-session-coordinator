@@ -1,0 +1,108 @@
+{
+  "name": "dsh-session-coordinator",
+  "version": "0.2.2",
+  "description": "DeepSeek Harness 会话协调插件：支持独立主会话、信息同步、总控与多个会话持续协作及忙时回信。",
+  "author": "zhdai",
+  "private": false,
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "keywords": [
+    "dsh",
+    "deepseek",
+    "plugin",
+    "session",
+    "session-coordinator",
+    "collaboration"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json",
+    "./client": "./src/client/index.js"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.1"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "files": [
+    "lib/**/*.js",
+    "lib/types/**/*.d.ts",
+    "dsh.plugin.json",
+    "cordis.patch.yml",
+    "scripts",
+    "src",
+    "src/client",
+    "CHANGELOG.md",
+    "README.md",
+    "docs/INSTALL.md",
+    "docs/USAGE.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit false --declaration --emitDeclarationOnly --outDir lib/types && tsdown",
+    "check:compat": "node scripts/check-dsh-compat.mjs",
+    "smoke": "node scripts/smoke-bundle.mjs && node scripts/test-delegation-bundle.mjs",
+    "test": "node scripts/test-peer-floor.mjs && node --experimental-strip-types --test scripts/test-discovery.mjs scripts/test-information.mjs && node --experimental-strip-types scripts/test-bridge-core.mjs && node --experimental-strip-types scripts/test-loop-guard.mjs && node --experimental-strip-types scripts/test-handoff.mjs && node --experimental-strip-types scripts/test-monitor-loop.mjs && node --experimental-strip-types scripts/test-tools-create.mjs && node --experimental-strip-types scripts/test-config.mjs && node --experimental-strip-types scripts/test-tools-archived.mjs && node --experimental-strip-types --test scripts/test-v4.mjs && node --experimental-strip-types scripts/test-relay.mjs && node --experimental-strip-types scripts/test-receipts.mjs && node --experimental-strip-types scripts/test-hop.mjs && node --experimental-strip-types scripts/test-coordinate.mjs && node --experimental-strip-types scripts/test-single-delegation.mjs && pnpm test:collaboration",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "tsdown",
+    "test:collaboration": "node --experimental-strip-types --test scripts/test-scoped-delivery.mjs scripts/test-collaboration.mjs scripts/test-collaboration-approval.mjs scripts/test-collaboration-store.mjs scripts/test-collaboration-materials.mjs scripts/test-collaboration-environment.mjs scripts/test-collaboration-material-tools.mjs scripts/ten-round-ledger.test.mjs scripts/test-busy-owner-proof.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-agent-preset-registry": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-home-paths": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-session": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-workspace": ">=0.2.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "cordis": "^4.0.0-rc.7",
+    "@deepseek-ai/dsh-storage": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-storage-domain": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-storage-json": ">=0.2.1-rc.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-agent-preset-registry": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-brand": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-home-paths": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-scope": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-session": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-session-format-catalog": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-storage": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-storage-domain": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-storage-json": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-util-values": ">=0.2.1-rc.1",
+    "@deepseek-ai/dsh-workspace": ">=0.2.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^24.0.0",
+    "cordis": "npm:@deepseek-ai/cordis@^4.0.5",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@deepseek-ai/node-addon-system": "^0.1.2",
+    "zod": "^4.4.3"
+  }
+}

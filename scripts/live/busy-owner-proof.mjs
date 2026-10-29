@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict'
+
+export const busyOwnerPrompt = '这是用户授权的隔离忙时收信协议验收：你是总控A，需要核对一张订单的商品与运费。使用session_coordinator_collaboration_start创建1个新的独立主会话“忙时订单·商品核算”，继承当前目录与模型。预算maxOperations=12,maxNoProgress=6,maxElapsedMs=240000，不设置token cap。创建1个task让B核算商品：3件每件19元、2件每件7元。send(intent=task)的正文必须要求B只调用acceptance_peer_gate和collaboration_result：先调用gate取得A已开始自身工作的同步凭证，然后自己计算商品总额，用result提交text恰为ITEMS_TOTAL=实际整数，并在evidence写计算过程，随后正常结束；B不负责运费和整合。你send成功后立即调用acceptance_busy_work一次，处理你负责的运费账；这个真实工具会在执行期间保持忙碌直到B的真实result已提交。工具正常完成后，在下一步读取实际B回信及工具返回的运费，调用acceptance_busy_integrate传入itemsTotal、shipping和combined三个实际整数，把商品与运费合并。不能预先编造B的回信。integrate成功后，用收到的真实resultIds先finish task，再finish scope；这两次finish都必须传同一非空resultIds数组和reason。确认completed，向用户汇报商品、运费与合计。全程禁止调用status取回结果，禁止session_coordinator_wait、collaboration_wait、旧send/create、任何临时子代理或无关工具；如果工具结束后的模型输入没有B回信，必须如实停止报告，不能用status或其他渠道补救。不要请求额外人工消息，也不要中断当前工具去处理回信。'
+
+/** Verify native behavior, not prompt text: a real peer result releases A's actual tool. */
+export function verifyBusyOwnerProof(report, scope) {
+  assert.equal(scope.state, 'completed')
+  const tasks = Object.values(scope.tasks), results = Object.values(scope.results)
+  assert.equal(scope.members.length, 2)
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0].state, 'completed')
+  assert.equal(results.length, 1)
+  const result = results[0], task = tasks[0], op = scope.operations[result.operationId]
+  assert.equal(result.text, 'ITEMS_TOTAL=71', 'B must actually calculate 3*19+2*7')
+  assert.ok(result.evidence.length > 0)
+  assert.equal(result.sender, report.sessions.B)
+  assert.equal(result.taskId, task.id)
+  assert.equal(result.taskRevision, task.revision)
+  assert.equal(result.stale, false)
+  assert.equal(op.target, report.sessions.B)
+  assert.equal(op.intent, 'task')
+  assert.equal(op.resultId, result.id)
+  assert.equal(op.requestInclusion?.evidence, 'native-llm-stream')
+  assert.ok(task.acceptedResultIds.includes(result.id))
+  assert.equal(Object.values(scope.operations).filter(item => item.intent === 'task').length, 1)
+  const notification = Object.values(scope.operations).filter(item => item.intent === 'result' && item.resultId === result.id)
+  assert.equal(notification.length, 1)
+  const inbound = report.inboundResults.filter(item => item.message.id === notification[0].id)
+  assert.equal(inbound.length, 1, 'actual result must be admitted into A history')
+  if (notification[0].requestInclusion) assert.equal(notification[0].requestInclusion.evidence, 'native-llm-stream')
+  const expectedSource = { kind: 'session-collaboration', scopeId: scope.id, taskId: task.id, taskRevision: task.revision, operationId: notification[0].id, senderSessionId: report.sessions.B, ownerSessionId: report.sessions.A, intent: 'result' }
+  assert.deepEqual(inbound[0].message.source, expectedSource)
+  const expectedText = `来自会话 ${result.sender} · 协作结果\n[协作 ${JSON.stringify(expectedSource)}；结果已记录。根据当前任务及证据决定下一步、返工或调用 collaboration_control finish；不要仅为确认收信回复。]\n协作目标：${scope.objective}\n当前任务：${task.objective}\n${result.text}`
+  assert.deepEqual(inbound[0].message.content, [{ type: 'text', text: expectedText }], 'the exact canonical business result must belong to this persisted scope and task')
+  if (notification[0].wire) assert.deepEqual(inbound[0].message, notification[0].wire)
+  const milestones = name => report.timeline.filter(item => item.name === name)
+  for (const name of ['busy-start', 'peer-result', 'busy-release', 'busy-end', 'integrate']) assert.equal(milestones(name).length, 1, name)
+  const [start, peer, release, end, integrate] = ['busy-start', 'peer-result', 'busy-release', 'busy-end', 'integrate'].map(name => milestones(name)[0])
+  const sends = report.tools.filter(item => item.sessionId === report.sessions.A && item.name === 'session_coordinator_collaboration_send')
+  assert.equal(sends.length, 1)
+  const sent = report.toolReceipts.find(item => item.sessionId === report.sessions.A && item.callId === sends[0].callId && !item.isError)
+  assert.ok(sent && sent.order < start.order, 'A must dispatch B successfully before entering its own long tool')
+  assert.equal(milestones('peer-gate').length, 1)
+  assert.equal(milestones('peer-gate')[0].sessionId, report.sessions.B)
+  assert.ok(start.order < peer.order && peer.order < release.order && release.order < end.order && end.order < integrate.order, 'B result must arrive strictly inside A tool execution')
+  assert.equal(peer.resultId, result.id)
+  assert.equal(release.cause, 'native-peer-result')
+  assert.equal(release.resultId, result.id)
+  assert.equal(start.turn, end.turn)
+  assert.equal(start.step, end.step, 'the running tool must finish its original step')
+  assert.equal(integrate.turn, start.turn, 'A must continue the same native turn')
+  assert.ok(integrate.step > start.step, 'A integrates in a subsequent model-issued step')
+  assert.deepEqual(integrate.arguments, { itemsTotal: 71, shipping: 9, combined: 80 })
+  const inclusions = report.requestInclusions.filter(item => item.message.id === notification[0].id && item.turn === start.turn && item.step > start.step && item.order > end.order && item.order < integrate.order)
+  assert.ok(inclusions.length > 0, 'A subsequent actual model request must contain the exact native result')
+  for (const inclusion of inclusions) assert.deepEqual(inclusion.message, inbound[0].message)
+  assert.ok(!report.timeline.some(item => item.name === 'verification-join' && item.order < release.order), 'post-run joins cannot release the tool')
+  assert.deepEqual(report.humanInputCounts, { [report.sessions.A]: 1, [report.sessions.B]: 0 })
+  assert.deepEqual(report.approvals, ['allowed-once'])
+  for (const id of [report.sessions.A, report.sessions.B]) {
+    const header = report.headers[id]
+    assert.equal(header.id, id)
+    assert.notEqual(header.origin, 'subagent')
+    assert.equal(header.parentSession, undefined)
+    assert.equal(header.delegationDepth ?? 0, 0)
+    const starts = report.nativeEvents.filter(item => item.sessionId === id && item.type === 'turn/start')
+    const ends = report.nativeEvents.filter(item => item.sessionId === id && item.type === 'turn/end')
+    assert.equal(starts.length, 1, 'each standalone chat executes exactly one native turn')
+    assert.equal(ends.length, 1)
+    assert.equal(ends[0].data.reason.kind, 'completed')
+    assert.equal(ends[0].data.turn, starts[0].data.turn)
+  }
+  const allowed = new Set(['acceptance_busy_work', 'acceptance_peer_gate', 'acceptance_busy_integrate', ...['start', 'task', 'send', 'result', 'control'].map(name => 'session_coordinator_collaboration_' + name)])
+  assert.ok(report.tools.every(item => allowed.has(item.name)), 'no wait, temporary-agent, legacy delivery or unrelated tools can rescue the scenario')
+  assert.equal(report.errors.length, 0)
+  assert.equal(report.fatalErrors.length, 0)
+  return { resultId: result.id, operationId: op.id, notificationId: notification[0].id, ownerTurn: start.turn, busyStep: start.step, integrationStep: integrate.step, itemsTotal: 71, shipping: 9, combined: 80, requestInclusionAnnotation: notification[0].requestInclusion ?? null }
+}

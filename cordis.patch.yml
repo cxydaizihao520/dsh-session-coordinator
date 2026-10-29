@@ -1,0 +1,8 @@
+# Bundle patch layer for dsh-session-coordinator. Referenced by the
+# package.json `dsh.bundle.patch` declaration, so `dsh plugin add` reconciles
+# this package into the profile's bundle list and this row mounts the plugin.
+# `name` must equal the package name — the Loader resolves it from the profile's
+# node_modules (where pnpm installs the checkout / local tarball).
+- insert:
+    - id: dsh-session-coordinator
+      name: dsh-session-coordinator
