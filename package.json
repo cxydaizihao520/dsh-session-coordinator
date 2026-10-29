@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-coordinator",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "DeepSeek Harness 会话协调插件：支持独立主会话、信息同步、总控与多个会话持续协作及忙时回信。",
   "author": "zhdai",
   "private": false,

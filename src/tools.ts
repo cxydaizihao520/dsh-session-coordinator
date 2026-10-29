@@ -331,7 +331,7 @@ function registerSend(env: BridgeEnv): void {
 function registerResume(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_coordinator_resume',
-    description: 'Bring an existing persisted (offline) session back online so session_coordinator_send / session_coordinator_wait / session_coordinator_read can operate on it. Resumes by session id; the session becomes live again (same as opening it). If already live this is a no-op. Provider/model default to the session previous config.',
+    description: 'Legacy standalone session management: load one persisted chat for session-level monitoring or an explicitly requested whole-chat reopen. Requires a target-specific /coordinate grant; a collaboration approval is not that grant. For a paused/interrupted collaboration, use session_coordinator_collaboration_control(action=resume) for the scope/task, then session_coordinator_collaboration_send for remaining work; that send loads an offline member automatically. Do not call this as a prerequisite to collaboration work or read-only history: session_coordinator_read reads persisted history without reopening. If already live this is a no-op. Provider/model default to the target session previous config.',
     parameters: {
       sessionId: { type: 'string', required: true, description: 'Session id to resume (persisted log must exist).' },
       provider: { type: 'string', description: 'Optional provider override.' },
@@ -1063,7 +1063,7 @@ function renderStatus(snapshot: BridgeStatusSnapshot, stalledMsThreshold: number
 function registerStatus(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_coordinator_status',
-    description: 'Inspect a session\'s live progress for monitoring/scheduling. Returns running/idle, whether a turn is open, last turn number, time since the last event (for stall detection), pending queued work, and the latest text reply. It also surfaces the session\'s chain-of-thought: lastReasoning is the most recent finalized reasoning block, liveReasoning is the in-flight reasoning streamed for the current handled turn (reasoning-delta), and reasoningTail is a compact merged preview. reasoning=none drops all three to keep tokens small. When stalledMsThreshold is given, marks a RUNNING session as stalled once the time since the last event exceeds it (idle sessions are never flagged — a quiet finished session is not stuck). Pass sessionId of a live session (use session_coordinator_find to locate; session_coordinator_resume to bring an offline one online). Use this as the "observe" step of a monitor→decide→steer/cancel loop.',
+    description: 'Inspect a session\'s live progress for monitoring/scheduling. Returns running/idle, whether a turn is open, last turn number, time since the last event (for stall detection), pending queued work, and the latest text reply. It also surfaces the session\'s chain-of-thought: lastReasoning is the most recent finalized reasoning block, liveReasoning is the in-flight reasoning streamed for the current handled turn (reasoning-delta), and reasoningTail is a compact merged preview. reasoning=none drops all three to keep tokens small. When stalledMsThreshold is given, marks a RUNNING session as stalled once the time since the last event exceeds it (idle sessions are never flagged — a quiet finished session is not stuck). Live chat execution only. For persistent collaboration task progress or restart recovery use session_coordinator_collaboration_status, which also covers offline members; use session_coordinator_read for offline history. Neither requires standalone resume. Use this live snapshot for authorized whole-session monitoring, not as a prerequisite to collaboration task control or dispatch.',
     parameters: {
       sessionId: { type: 'string', required: true, description: 'Session id to inspect (must be live).' },
       stalledMsThreshold: { type: 'number', description: 'Mark a RUNNING session STALLED when time since the last event exceeds this many ms (default 60000); idle sessions are never marked.' },
@@ -1084,7 +1084,7 @@ function registerStatus(env: BridgeEnv): void {
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
       const agent = liveAgent(env, args.sessionId)
       if (agent === undefined) {
-        throw new Error('session ' + JSON.stringify(args.sessionId) + ' is not live — call session_coordinator_resume first (status requires a live session)')
+        throw new Error('session ' + JSON.stringify(args.sessionId) + ' is not live. Use session_coordinator_collaboration_status for persistent task/scope state or session_coordinator_read for persisted history; neither requires reopening. Collaboration work loads the member through collaboration_send after approved scope/task resume. Standalone session monitoring requires its separate target grant and session_coordinator_resume')
       }
       const threshold = typeof args.stalledMsThreshold === 'number' && Number.isFinite(args.stalledMsThreshold) && args.stalledMsThreshold >= 0 ? args.stalledMsThreshold : 60000
       const reasoningMode: StatusReasoning = args.reasoning === 'none' || args.reasoning === 'last' || args.reasoning === 'live' ? args.reasoning : 'tail'
@@ -1116,7 +1116,7 @@ interface CancelArgs {
 function registerCancel(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_coordinator_cancel',
-    description: 'Stop a running session: abort the active turn (and if keepInbox is false, also clear queued/steering work). Mirrors the agent cancel primitive. Use this as the "stop" step of a monitor→decide loop when a task has gone wrong, is stuck, or should be terminated. Returns the session state after cancellation. To resume later use session_coordinator_resume; to re-queue work use session_coordinator_send.',
+    description: 'Legacy WHOLE-SESSION management: abort the entire active turn of a live chat, including unrelated tasks in that turn; by default also clear all queued work. Requires a target-specific /coordinate grant. Use only when the user explicitly wants to stop that whole chat or for its authorized session-level monitor. To stop, pause or resume a task inside a collaboration, use session_coordinator_collaboration_control with scopeId and taskId instead. To close a collaboration scope use that control without taskId. This tool does not control collaboration task/scope state.',
     parameters: {
       sessionId: { type: 'string', required: true, description: 'Session id to cancel (must be live).' },
       keepInbox: { type: 'boolean', description: 'Preserve queued/steering input instead of clearing it (default false, i.e. clear pending work).' },
