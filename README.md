@@ -55,3 +55,5 @@ pnpm pack
 更多表达方式见[使用手册](docs/USAGE.md)。反馈到 [GitHub Issues](https://github.com/cxydaizihao520/dsh-session-coordinator/issues)，附版本、脱敏复现步骤和具体错误；不要上传密钥或完整私人会话。
 
 MIT，见 [LICENSE](LICENSE)。
+
+维护与收录：[发布流程](docs/RELEASING.md) · [投稿材料状态](docs/submission/STATUS.md)。

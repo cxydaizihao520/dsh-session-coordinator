@@ -1,0 +1,6 @@
+url: https://github.com/cxydaizihao520/dsh-session-coordinator
+name: cxydaizihao520/dsh-session-coordinator
+category: session
+description:
+  en: 'Coordinate independent DeepSeek Harness sessions with a Codex-inspired workflow for approved multi-round tasks, shared context, results, task controls and diagnostic exports.'
+  zh: '参考 Codex 的独立会话协作设计，让 DeepSeek Harness 主会话在审批范围内持续派工、复核和回收结果，支持信息同步、任务控制与协作日志导出。'
