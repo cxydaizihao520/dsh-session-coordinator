@@ -1,3 +1,4 @@
+import { diagnosticTool, observeDiagnostics } from './diagnostics.ts'
 /**
  * dsh-session-coordinator 模型面向工具：create / send / resume / wait / read / find。
  * 全部经插件宿主 ctx 操作真实 DSH 会话（顶层主会话与任意其它会话）。
@@ -133,7 +134,7 @@ interface CreateArgs {
 }
 
 function registerCreate(env: BridgeEnv): void {
-  env.ctx.tools.register(defineTool({
+  env.ctx.tools.register(diagnosticTool(env.ctx, defineTool({
     name: 'session_coordinator_create',
     description: 'Create a real independent main chat, visible in the sidebar with its own history and available for later conversation. Use for a user-requested new chat/session (新会话/独立会话), rather than a temporary team/subagent. This entry grants native approval for one task/reply only; for joint delivery, review/rework or continued rounds use collaboration_start with newSessions. Defaults to the current workspace/model. Asynchronous by default; waitForReply waits for this task reply, not assistant text. On uncertain creation/delivery inspect the returned identity; do not create another chat or resend automatically.',
     parameters: {
@@ -201,7 +202,7 @@ function registerCreate(env: BridgeEnv): void {
           ', creationConfirmed=' + String(created !== undefined) + ': ' + (error instanceof Error ? error.message : String(error)))
       }
     }
-  }))
+  })))
 }
 
 interface SendArgs {
@@ -221,7 +222,7 @@ interface SendArgs {
 
 function registerSend(env: BridgeEnv): void {
   const batches = new Map<string, { fingerprint: string; run: Promise<Record<string, unknown>> }>()
-  env.ctx.tools.register(defineTool({
+  env.ctx.tools.register(diagnosticTool(env.ctx, defineTool({
     name: 'session_coordinator_send',
     description: 'Legacy one-task/reply or information delivery; source.kind=session-collaboration uses collaboration_send/result instead and has its own approved multi-round scope. Deliver an outgoing task with existing target authorization or native approval for this one call, or the ONE eligible reply to a verified legacy incoming task. For an eligible reply use its sender session id and task messageId. A received result-context is the result already delivered to its originator; receive-only results are context without a separate summary, while other results complete the human task. mode=steer (default) schedules the next step without aborting; mode=queue schedules the next turn. Offline targets resume after permission is checked. waitForReply=true waits for the correlated task reply, not assistant text or idleness. A terminal legacy reply never waits for another reply. ' + HOP_RULE_TEXT,
     parameters: {
@@ -325,7 +326,7 @@ function registerSend(env: BridgeEnv): void {
         : undefined
       return asJson({ ...sent, ...(reply === undefined ? {} : { reply }) })
     },
-  }))
+  })))
 }
 
 function registerResume(env: BridgeEnv): void {
@@ -816,6 +817,7 @@ const BRIDGE_TOOL_REGISTRARS: ReadonlyArray<(env: BridgeEnv) => void> = [
 
 /** 注册全部工具（顺序即 {@link BRIDGE_TOOL_REGISTRARS} 的顺序）。 */
 export function registerBridgeTools(env: BridgeEnv): void {
+  observeDiagnostics(env.ctx)
   env.delivery ??= new SessionDelivery(env.ctx, env.registry, env.grants)
   for (const register of BRIDGE_TOOL_REGISTRARS) register(env)
 }

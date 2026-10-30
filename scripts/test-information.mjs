@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { Session } from '@deepseek-ai/dsh-session'
+import { Session, pluginRecordOf } from '@deepseek-ai/dsh-session'
 import { registerBridgeTools } from '../src/tools.ts'
 import { createGrants } from '../src/coordinate.ts'
 
@@ -95,7 +95,11 @@ test('approval rejection and revocation stop the entire group before any deliver
 
 test('archiving during asynchronous preparation prevents sending to the old target', async () => {
   const h = fixture(); h.grants.grant('A', ['B'])
-  h.ctx.sessions = { flush: async session => { if (session.id === 'A') h.ctx.workspaceRegistry.archivedSessionIds.push('B'); return true } }
+  h.ctx.sessions = { flush: async session => {
+    const record = pluginRecordOf(session.snapshotEvents().at(-1))
+    if (session.id === 'A' && record?.type === 'plugin:dsh-session-coordinator/delivery' && record.data.stage === 'intent') h.ctx.workspaceRegistry.archivedSessionIds.push('B')
+    return true
+  } }
   const args = { sessionId: 'B', message: 'stop', intent: 'information', requestId: 'archive-race' }
   await assert.rejects(h.run(args), /target changed/)
   assert.equal(h.agents.get('B').session.snapshotEvents().some(e => e.type === 'user/message'), false)

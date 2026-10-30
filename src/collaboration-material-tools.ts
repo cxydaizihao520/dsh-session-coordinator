@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { BridgeEnv } from './tools.ts'
-import type { CollaborationRuntime, CollaborationExecution, CollaborationScope, CollaborationTask } from './collaboration.ts'
+import { resolveCollaborationMember, type CollaborationRuntime, type CollaborationExecution, type CollaborationScope, type CollaborationTask } from './collaboration.ts'
 import type { JsonValue } from './collaboration-store.ts'
 import { getLiveAgent, inspectPersistedSession, sessionEvents, type LiveAgentLike } from './core.ts'
 import { resumeBridgeSession } from './session-create.ts'
@@ -37,16 +37,18 @@ export function registerCollaborationMaterialTools(env: BridgeEnv, ready: Promis
     parameters: {
       scopeId: { type: 'string', required: true }, taskId: { type: 'string', required: true },
       action: { type: 'string', required: true, enum: ['checkpoint', 'read-context', 'resolve-references', 'fork', 'worktree', 'inspect', 'integrate', 'verify'] },
-      sourceSessionId: { type: 'string' }, sessionId: { type: 'string' }, contextId: { type: 'string' }, inputMessageId: { type: 'string' }, operationId: { type: 'string' },
+      sourceSessionId: { type: 'string', description: 'Exact sessionId or a memberRef from this scope’s memberDirectory.' }, sessionId: { type: 'string', description: 'Exact sessionId or a memberRef from this scope’s memberDirectory; this does not grant task membership.' }, contextId: { type: 'string' }, inputMessageId: { type: 'string' }, operationId: { type: 'string' },
       constraints: strings, decisions: strings, pending: strings, atSeq: { type: 'number' }, from: { type: 'string' }, name: { type: 'string' }, path: { type: 'string' }, expectedSourceCommit: { type: 'string' }, expectedTargetCommit: { type: 'string' },
     },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, result) => [{ type: 'text' as const, text: JSON.stringify(result) }] },
     async execute(raw, execution) {
       try {
-      const args = raw as MaterialArguments, exec = execution as CollaborationExecution, runtime = await ready
+      const args = { ...raw } as MaterialArguments, exec = execution as CollaborationExecution, runtime = await ready
       const caller = exec.agent as LiveAgentLike
       const snapshot = await runtime.withTask(args.scopeId, args.taskId, exec, (task, scope) => ({ task, scope }), { ownerOnly: !['read-context', 'resolve-references', 'verify', 'inspect'].includes(args.action) })
       const { task, scope } = snapshot
+      if (args.sessionId !== undefined) args.sessionId = resolveCollaborationMember(scope, args.sessionId)
+      if (args.sourceSessionId !== undefined) args.sourceSessionId = resolveCollaborationMember(scope, args.sourceSessionId)
       let signal = exec.signal
       const actor = async (id: string): Promise<LiveAgentLike> => {
         participant(task, scope, id)

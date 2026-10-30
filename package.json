@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-coordinator",
-  "version": "0.2.8",
+  "version": "0.2.15",
   "description": "DeepSeek Harness 会话协调插件：支持独立主会话、信息同步、总控与多个会话持续协作及忙时回信。",
   "author": "zhdai",
   "private": false,
@@ -41,18 +41,20 @@
     "src/client",
     "CHANGELOG.md",
     "README.md",
+    "LICENSE",
     "docs/INSTALL.md",
     "docs/USAGE.md",
-    "LICENSE"
+    "docs/ACCEPTANCE.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit false --declaration --emitDeclarationOnly --outDir lib/types && tsdown",
     "check:compat": "node scripts/check-dsh-compat.mjs",
     "smoke": "node scripts/smoke-bundle.mjs && node scripts/test-delegation-bundle.mjs",
-    "test": "node scripts/test-peer-floor.mjs && node --experimental-strip-types --test scripts/test-discovery.mjs scripts/test-information.mjs && node --experimental-strip-types scripts/test-bridge-core.mjs && node --experimental-strip-types scripts/test-loop-guard.mjs && node --experimental-strip-types scripts/test-handoff.mjs && node --experimental-strip-types scripts/test-monitor-loop.mjs && node --experimental-strip-types scripts/test-tools-create.mjs && node --experimental-strip-types --test scripts/test-session-resume.mjs && node --experimental-strip-types scripts/test-config.mjs && node --experimental-strip-types scripts/test-tools-archived.mjs && node --experimental-strip-types --test scripts/test-v4.mjs && node --experimental-strip-types scripts/test-relay.mjs && node --experimental-strip-types scripts/test-receipts.mjs && node --experimental-strip-types scripts/test-hop.mjs && node --experimental-strip-types scripts/test-coordinate.mjs && node --experimental-strip-types scripts/test-single-delegation.mjs && pnpm test:collaboration",
+    "test": "node scripts/test-peer-floor.mjs && node --experimental-strip-types --test scripts/test-discovery.mjs scripts/test-information.mjs && node --experimental-strip-types scripts/test-bridge-core.mjs && node --experimental-strip-types scripts/test-loop-guard.mjs && node --experimental-strip-types scripts/test-handoff.mjs && node --experimental-strip-types scripts/test-monitor-loop.mjs && node --experimental-strip-types scripts/test-tools-create.mjs && node --experimental-strip-types --test scripts/test-session-resume.mjs && node --experimental-strip-types scripts/test-config.mjs && node --experimental-strip-types scripts/test-tools-archived.mjs && node --experimental-strip-types --test scripts/test-v4.mjs && node --experimental-strip-types scripts/test-relay.mjs && node --experimental-strip-types scripts/test-client-bundle.mjs && node --experimental-strip-types scripts/test-receipts.mjs && node --experimental-strip-types scripts/test-hop.mjs && node --experimental-strip-types scripts/test-coordinate.mjs && node --experimental-strip-types scripts/test-single-delegation.mjs && pnpm test:collaboration",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepare": "tsdown",
-    "test:collaboration": "node --experimental-strip-types --test scripts/test-scoped-delivery.mjs scripts/test-collaboration.mjs scripts/test-collaboration-approval.mjs scripts/test-collaboration-store.mjs scripts/test-collaboration-materials.mjs scripts/test-collaboration-environment.mjs scripts/test-collaboration-material-tools.mjs scripts/ten-round-ledger.test.mjs scripts/test-busy-owner-proof.mjs scripts/test-controls-proof.mjs scripts/test-loop-boundary-proof.mjs scripts/test-recovery-proof.mjs"
+    "prepare": "pnpm build",
+    "test:collaboration": "node --experimental-strip-types --test scripts/test-scoped-delivery.mjs scripts/test-collaboration.mjs scripts/test-collaboration-approval.mjs scripts/test-collaboration-store.mjs scripts/test-collaboration-materials.mjs scripts/test-collaboration-environment.mjs scripts/test-collaboration-material-tools.mjs scripts/routing-rounds-acceptance.test.mjs scripts/ten-round-ledger.test.mjs scripts/test-busy-owner-proof.mjs scripts/test-controls-proof.mjs scripts/test-loop-boundary-proof.mjs scripts/test-recovery-proof.mjs scripts/test-diagnostics.mjs",
+    "test:collaboration:host": "node --experimental-strip-types --test scripts/test-collaboration-materials-host.mjs"
   },
   "dsh": {
     "bundle": {
@@ -104,5 +106,13 @@
   "dependencies": {
     "@deepseek-ai/node-addon-system": "^0.1.2",
     "zod": "^4.4.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cxydaizihao520/dsh-session-coordinator.git"
+  },
+  "homepage": "https://github.com/cxydaizihao520/dsh-session-coordinator#readme",
+  "bugs": {
+    "url": "https://github.com/cxydaizihao520/dsh-session-coordinator/issues"
   }
 }

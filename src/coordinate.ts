@@ -1,3 +1,4 @@
+import { exportDiagnostics, exportRelatedDiagnostics } from './diagnostics.ts'
 import type { Context } from '@deepseek-ai/cordis'
 
 /** 命令名（注册到 `ctx.commands`）。 */
@@ -33,7 +34,7 @@ export function createGrants(): CoordinationGrants {
 export function denialMessage(sessionId: string, action: GatedAction, targetId?: string): string {
   return 'session ' + JSON.stringify(sessionId) + ' is not authorized to coordinate other sessions: ' + action +
     ' refused for ' + JSON.stringify(targetId ?? '(new session)') +
-    '. Ask the human to run /coordinate on <target-session-id ...>. Only the specified targets are allowed; ' +
+    '. This is the legacy single-exchange entry. For a human-requested ongoing collaboration, the originating chat must use collaboration_start and its native scope approval, not /coordinate on. For an explicitly single exchange, ask the human to run /coordinate on <target-session-id ...>. Only the specified targets are allowed; ' +
     'a verified incoming task permits one reply to its sender without another grant. Read-only tools are never gated. ' +
     (action === 'create' ? 'Create sessions in the UI first, then authorize their ids.' : '')
 }
@@ -69,7 +70,7 @@ export function runCoordinateCommand(grants: CoordinationGrants, sessionId: stri
   const targets = grants.list(sessionId)
   return { kind: 'success', text: targets.length === 0
     ? '本会话未授权任何目标。只读查询仍可用；/coordinate on <目标会话id ...> 指定目标。'
-    : '已授权本会话仅协调：' + targets.join(', ') + '。接收方可回信一次，无需单独授权。重启失效；/coordinate off 收回。' }
+    : '单次模式：已授权本会话仅协调：' + targets.join(', ') + '。每次单次任务的接收方可向发送者回信一次，无需单独授权；这不是持续协作的轮数限制。多轮协作请在原发起会话提出持续任务，由 collaboration_start 审批范围后自动推进。本单次授权重启失效；/coordinate off 收回。' }
 }
 
 interface CommandsLike {
@@ -100,11 +101,13 @@ export function registerCoordinateCommand(
       if (commands === undefined || typeof commands.register !== 'function') return
       commands.register({
         name: COORDINATE_COMMAND,
-        description: '指定可协调的会话：/coordinate on <目标id ...>；off 收回，status 查询。',
-        input: { hint: 'on <目标会话id ...> | off | status' },
+        description: '指定可协调的会话：/coordinate on <目标id ...>；off 收回，status 查询；logs [对方id ...] 导出不含正文的排障日志。',
+        input: { hint: 'on <目标会话id ...> | off | status | logs [对方id ...]' },
         handler: (payload) => {
           const callerId = payload.agent?.id ?? ''
           const raw = (payload.rawInput ?? '').trim()
+          if (raw === 'logs-related') return exportRelatedDiagnostics(ctx, callerId).then(value => ({ kind: 'success' as const, text: JSON.stringify(value) }), () => ({ kind: 'error' as const, text: '无法导出协作日志，请稍后重试。' }))
+          if (raw === 'logs' || raw.startsWith('logs ')) return exportDiagnostics(ctx, callerId, raw.split(/\s+/).slice(1)).then(value => ({ kind: 'success' as const, text: JSON.stringify(value, null, 2) }), () => ({ kind: 'error' as const, text: '无法导出协作日志；请核对当前会话和明确的对方会话ID。' }))
           if (raw.startsWith('send ') && send !== undefined) return send(callerId, raw.slice(5))
           const result = runCoordinateCommand(grants, callerId, raw)
           if (result.kind === 'success' && parseCoordinateInput(raw)?.verb !== 'status') revoke?.(callerId)

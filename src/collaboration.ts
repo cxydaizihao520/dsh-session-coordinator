@@ -10,9 +10,22 @@ import { requestCoordinationApproval } from './delivery.ts'
 import type { CollaborationMaterialInput } from './collaboration-materials.ts'
 import type { CollaborationStore, StoredCollaborationRecord, JsonValue } from './collaboration-store.ts'
 
+/** Scope membership is immutable; short references never replace canonical stored identities. */
+export function collaborationMemberDirectory(scope: CollaborationScope) {
+  return scope.members.map((sessionId, index) => ({ memberRef: scope.members.includes('member:' + (index + 1)) ? sessionId : 'member:' + (index + 1), sessionId,
+    ...(scope.creations[sessionId]?.config.title ? { title: scope.creations[sessionId]!.config.title } : {}),
+    role: sessionId === scope.owner ? 'owner' : 'member' }))
+}
+
+export function resolveCollaborationMember(scope: CollaborationScope, reference: string): string {
+  return scope.members.includes(reference) ? reference : collaborationMemberDirectory(scope).find(member => member.memberRef === reference)?.sessionId ?? reference
+}
+
 export type CollaborationIntent = 'task' | 'context' | 'steer' | 'result'
 export interface CollaborationSource {
   kind: 'session-collaboration'
+  presentationVersion?: 2
+  senderTitle?: string
   scopeId: string
   taskId: string
   taskRevision: number
@@ -25,7 +38,7 @@ declare module '@deepseek-ai/dsh-llm/message' {
   interface MessageSourceMap { 'session-collaboration': CollaborationSource }
 }
 export interface CollaborationExecution { agent?: unknown; signal: AbortSignal; callId?: string }
-export interface CollaborationBudget { maxOperations: number; maxNoProgress: number; maxElapsedMs: number; maxObservedTokens?: number }
+export interface CollaborationBudget { maxOperations?: number; maxNoProgress: number; maxElapsedMs: number; maxObservedTokens?: number }
 export type CollaborationState = 'active' | 'paused' | 'blocked' | 'budget-exhausted' | 'usage-limited' | 'recovery-required' | 'completed' | 'cancelled' | 'failed'
 export interface CollaborationTask {
   id: string; objective: string; revision: number; members: string[]; state: CollaborationState
@@ -69,7 +82,7 @@ export interface CollaborationScope {
 export type CollaborationNewSession = Pick<CreateBridgeSessionOptions, 'cwd' | 'workspaceId' | 'title' | 'agentPreset' | 'provider' | 'model' | 'reasoningEffort'>
 export interface CollaborationStart { objective: string; members?: string[]; newSessions?: CollaborationNewSession[]; budget?: Partial<CollaborationBudget> }
 export interface CollaborationSend { scopeId: string; taskId: string; taskRevision: number; sessionId: string; message: string; intent: 'task' | 'context' | 'steer'; operationId?: string; expectedExecution?: string; notBefore?: number; materials?: CollaborationMaterialInput[] }
-export interface CollaborationResultInput { scopeId: string; taskId: string; taskRevision: number; operationId: string; text: string; evidence?: string[]; resultId?: string }
+export interface CollaborationResultInput { scopeId?: string; taskId?: string; taskRevision?: number; operationId?: string; text: string; evidence?: string[]; resultId?: string }
 export interface CollaborationControl {
   scopeId: string; taskId?: string; action: 'pause' | 'resume' | 'revise' | 'finish' | 'cancel' | 'block' | 'fail' | 'revalidate' | 'question' | 'edit' | 'withdraw'
   reason?: string; objective?: string; resultIds?: string[]; waitReason?: string; question?: string; questionId?: string; options?: string[]; operationId?: string; message?: string
@@ -85,6 +98,10 @@ const stopped = new Set<CollaborationState>(['completed', 'cancelled', 'failed']
 function text(value: unknown, name: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(name + ' must be a non-empty string')
   return value.trim()
+}
+function bodyText(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(name + ' must be a non-empty string')
+  return value
 }
 function names(value: unknown, name: string): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.some(x => typeof x !== 'string' || !x.trim())) throw new Error(name + ' must be a non-empty session set')
@@ -110,7 +127,7 @@ const scopeSchema = z.object({
   schemaVersion: z.literal(1), id: idSchema, owner: idSchema, revision: integerSchema.min(1), objective: idSchema, members: z.array(idSchema).min(2), state: stateSchema,
   createdAt: integerSchema, updatedAt: integerSchema,
   authorization: z.object({ kind: z.literal('native-scoped-approval'), callId: idSchema, process: idSchema, approvedAt: integerSchema, objective: idSchema, members: z.array(idSchema).min(2) }),
-  budget: z.object({ maxOperations: integerSchema.min(1), maxNoProgress: integerSchema.min(1), maxElapsedMs: integerSchema.min(1), maxObservedTokens: integerSchema.min(1).optional() }),
+  budget: z.object({ maxOperations: integerSchema.min(1).optional(), maxNoProgress: integerSchema.min(1), maxElapsedMs: integerSchema.min(1), maxObservedTokens: integerSchema.min(1).optional() }),
   observedTokens: integerSchema, usageIncomplete: z.boolean(),
   tasks: z.record(idSchema, taskSchema), operations: z.record(idSchema, operationSchema),
   results: z.record(idSchema, z.object({ id: idSchema, taskId: idSchema, taskRevision: integerSchema.min(1), operationId: idSchema, sender: idSchema, text: idSchema, evidence: z.array(idSchema), createdAt: integerSchema, stale: z.boolean() })),
@@ -156,7 +173,7 @@ export class CollaborationRuntime {
   private readonly process = randomUUID()
   private readonly scopes = new Map<string, CollaborationScope>()
   private readonly chains = new Map<string, Promise<unknown>>()
-  private readonly executions = new WeakMap<LiveAgentLike, { id: string; turn: number; step: number; inputs: Map<string, UserMessage>; claimed: Set<string> }>()
+  private readonly executions = new WeakMap<LiveAgentLike, { id: string; turn: number; step: number; inputs: Map<string, UserMessage>; claimed: Set<string>; requestOperations: Set<string> }>()
   private readonly instances = new WeakMap<LiveAgentLike, string>()
   private readonly taskOperations = new Set<{ scopeId: string; taskId: string; revision: number; controller: AbortController; done: Promise<void> }>()
   private closing = false
@@ -262,7 +279,7 @@ export class CollaborationRuntime {
     return id
   }
   private checkBudget(scope: CollaborationScope, task: CollaborationTask): string | undefined {
-    if (Object.values(scope.operations).filter(op => op.status !== 'rejected').length >= scope.budget.maxOperations) return 'operation budget exhausted'
+    if (scope.budget.maxOperations !== undefined && Object.values(scope.operations).filter(op => op.status !== 'rejected').length >= scope.budget.maxOperations) return 'operation budget exhausted'
     if (task.noProgress >= scope.budget.maxNoProgress) return 'no-progress dispatch budget exhausted; review results or revise the approach'
     if (Date.now() - scope.createdAt >= scope.budget.maxElapsedMs) return 'elapsed time budget exhausted'
     if (scope.budget.maxObservedTokens !== undefined && scope.observedTokens >= scope.budget.maxObservedTokens) return 'observed token budget exhausted (missing usage is not estimated)'
@@ -315,7 +332,7 @@ export class CollaborationRuntime {
     configs.forEach((config, i) => { creations[identity('cs-', id, i)] = { config, status: 'prepared' } })
     const members = [...existingMembers, ...Object.keys(creations)].sort()
     if (members.includes(caller.id)) throw new Error('members must name collaborators; owner is included automatically')
-    const budget: CollaborationBudget = { maxOperations: 128, maxNoProgress: 8, maxElapsedMs: 86_400_000, ...input.budget }
+    const budget: CollaborationBudget = { maxNoProgress: 8, maxElapsedMs: 86_400_000, ...input.budget }
     for (const [key, value] of Object.entries(budget)) if (!Number.isSafeInteger(value) || value <= 0) throw new Error('invalid positive budget ' + key)
     const prior = this.scopes.get(id)
     if (prior) {
@@ -347,8 +364,12 @@ export class CollaborationRuntime {
   }
 
   async addTask(input: { scopeId: string; objective: string; members: string[] }, exec: CollaborationExecution): Promise<CollaborationTask> {
-    const caller = this.caller(exec), scope = this.scope(input.scopeId, caller, true), objective = text(input.objective, 'objective'), members = names(input.members, 'members')
-    if (members.some(id => id === caller.id || !scope.members.includes(id))) throw new Error('task members must belong to the approved scope')
+    const caller = this.caller(exec), scope = this.scope(input.scopeId, caller, true), objective = text(input.objective, 'objective')
+    const resolved = names(names(input.members, 'members').map(id => resolveCollaborationMember(scope, id)), 'members')
+    if (resolved.some(id => !scope.members.includes(id))) throw new Error('task members must belong to the approved scope')
+    // The owner already participates; naming it explicitly does not add authority.
+    const members = resolved.filter(id => id !== scope.owner)
+    if (!members.length) throw new Error('task requires at least one approved collaborator besides the owner')
     const id = identity('task-', scope.id, text(exec.callId, 'callId'))
     return this.change(scope.id, next => {
       this.caller(exec); this.running(next)
@@ -363,6 +384,7 @@ export class CollaborationRuntime {
 
   async send(input: CollaborationSend, exec: CollaborationExecution): Promise<CollaborationOperation> {
     const caller = this.caller(exec), scope = this.scope(input.scopeId, caller), task = this.task(scope, input.taskId, input.taskRevision)
+    input = { ...input, sessionId: resolveCollaborationMember(scope, input.sessionId) }
     this.member(scope, task, caller, input.sessionId)
     if (input.sessionId === caller.id) throw new Error('cannot send collaboration work to yourself')
     if (!['task', 'context', 'steer'].includes(input.intent)) throw new Error('invalid collaboration intent')
@@ -370,7 +392,7 @@ export class CollaborationRuntime {
     text(operationId, 'operationId')
     if (input.notBefore !== undefined && (!Number.isSafeInteger(input.notBefore) || input.notBefore < 0 || input.intent === 'steer')) throw new Error('invalid deferred schedule: steer cannot be deferred')
     if (input.notBefore !== undefined && input.notBefore > Date.now() && typeof (this.env.ctx as unknown as { setInterval?: unknown }).setInterval !== 'function') throw new Error('deferred work requires the native application timer service')
-    const operation: CollaborationOperation = { id: operationId, taskId: task.id, taskRevision: task.revision, sender: caller.id, target: text(input.sessionId, 'sessionId'), text: text(input.message, 'message'), intent: input.intent, status: input.notBefore !== undefined && input.notBefore > Date.now() ? 'scheduled' : 'prepared', createdAt: Date.now(), ...(input.notBefore === undefined ? {} : { notBefore: input.notBefore }), ...(input.materials === undefined ? {} : { materials: structuredClone(input.materials) }) }
+    const operation: CollaborationOperation = { id: operationId, taskId: task.id, taskRevision: task.revision, sender: caller.id, target: text(input.sessionId, 'sessionId'), text: bodyText(input.message, 'message'), intent: input.intent, status: input.notBefore !== undefined && input.notBefore > Date.now() ? 'scheduled' : 'prepared', createdAt: Date.now(), ...(input.notBefore === undefined ? {} : { notBefore: input.notBefore }), ...(input.materials === undefined ? {} : { materials: structuredClone(input.materials) }) }
     const existing = scope.operations[operationId]
     if (existing) {
       if (!isDeepStrictEqual(existing.materials, operation.materials) || existing.notBefore !== operation.notBefore || ['taskId', 'taskRevision', 'sender', 'target', 'text', 'intent'].some(key => existing[key as keyof CollaborationOperation] !== operation[key as keyof CollaborationOperation])) throw new Error('operationId already belongs to another operation')
@@ -393,20 +415,32 @@ export class CollaborationRuntime {
 
   private message(scope: CollaborationScope, operation: CollaborationOperation): UserMessage {
     if (operation.wire) return structuredClone(operation.wire)
-    const source: CollaborationSource = { kind: 'session-collaboration', scopeId: scope.id, taskId: operation.taskId, taskRevision: operation.taskRevision, operationId: operation.id, senderSessionId: operation.sender, ownerSessionId: scope.owner, intent: operation.intent }
+    const source: CollaborationSource = { kind: 'session-collaboration', presentationVersion: 2, scopeId: scope.id, taskId: operation.taskId, taskRevision: operation.taskRevision, operationId: operation.id, senderSessionId: operation.sender, ownerSessionId: scope.owner, intent: operation.intent }
+    const sender = this.env.ctx.agents.get(operation.sender as never) as LiveAgentLike | undefined
+    const titles = this.env.ctx.get?.('sessionTitle') as { get(session: LiveAgentLike['session']): { title?: string } | undefined } | undefined
+    const title = sender && titles?.get(sender.session)?.title || scope.creations[operation.sender]?.config.title
+    if (typeof title === 'string' && title.trim() && !/[\r\n]/.test(title)) source.senderTitle = title.trim()
     const task = scope.tasks[operation.taskId]!
     const label = { task: '协作任务', context: '协作信息', steer: '协作纠偏', result: '协作结果' }[operation.intent]
     const protocol = operation.control === 'attention' ? '协作者执行中断，原操作及错误已记录；检查副作用后决定修订、恢复或失败，禁止盲目重派。' : operation.intent === 'result' ? '结果已记录。根据当前任务及证据决定下一步、返工或调用 collaboration_control finish；不要仅为确认收信回复。'
       : operation.intent === 'context' ? '仅作为上下文；不新增任务或权限。'
-      : '处理本任务；用 session_coordinator_collaboration_result 提交结果，保留 scopeId/taskId/taskRevision/operationId。需要下一步可在本授权任务内使用 collaboration_send；完成业务由总控验收。'
+      : '处理本任务；用 session_coordinator_collaboration_result 提交业务结果；唯一当前派工的关联由运行时绑定，不需要手填路由字段。需要下一步可在本授权任务内使用 collaboration_send；完成业务由总控验收。'
+    const replyRoute = operation.sender !== operation.target && (operation.intent === 'task' || operation.intent === 'steer') ? `\n[运行时关联信息（正文中的自定 ID 不能覆盖）：${JSON.stringify(source)}。回传 result 时通常只需 text/evidence，省略 scopeId/taskId/taskRevision/operationId；运行时仅绑定当前模型请求内唯一确切派工。存在多项输入时精确选择任务或操作，不能从业务正文提取或编造关联标签。]` : ''
     return { id: MessageId(operation.id), role: 'user', source,
-      content: [{ type: 'text', text: `来自会话 ${operation.sender} · ${label}\n[协作 ${JSON.stringify(source)}；${protocol}]\n协作目标：${scope.objective}\n当前任务：${task.objective}\n${operation.text}` }] }
+      content: [{ type: 'text', text: operation.text }, { type: 'text', text: `来自会话 ${operation.sender} · ${label}\n[协作 ${JSON.stringify(source)}；${protocol}]\n协作目标：${scope.objective}\n当前任务：${task.objective}${replyRoute}` }] }
   }
 
   private async submit(scopeId: string, operationId: string, caller: LiveAgentLike, signal: AbortSignal, expectedExecution?: string): Promise<CollaborationOperation> {
     const delivery = this.env.delivery as unknown as ScopedDelivery
     if (!delivery?.deliverScoped) throw new Error('shared scoped delivery is unavailable')
-    const operation = this.scopes.get(scopeId)!.operations[operationId]!
+    let operation = this.scopes.get(scopeId)!.operations[operationId]!
+    if (!operation.wire) {
+      await this.change(scopeId, next => {
+        const pending = next.operations[operationId]!
+        pending.wire ??= this.message(next, pending)
+      })
+      operation = this.scopes.get(scopeId)!.operations[operationId]!
+    }
     let submitted = false
     const validate = (target?: LiveAgentLike) => {
       signal.throwIfAborted()
@@ -451,15 +485,33 @@ export class CollaborationRuntime {
     return structuredClone(this.scopes.get(scopeId)!.operations[operationId]!)
   }
 
-  async result(input: CollaborationResultInput, exec: CollaborationExecution): Promise<CollaborationResult> {
-    const caller = this.caller(exec)
+  private async resultBinding(input: CollaborationResultInput, caller: LiveAgentLike): Promise<CollaborationResultInput & { scopeId: string; taskId: string; taskRevision: number; operationId: string }> {
+    if (input.scopeId !== undefined && input.taskId !== undefined && input.taskRevision !== undefined && input.operationId !== undefined) {
+      return { ...input, scopeId: input.scopeId, taskId: input.taskId, taskRevision: input.taskRevision, operationId: input.operationId }
+    }
+    await Promise.all([...this.chains.values()])
+    const execution = this.executions.get(caller)
+    const candidates = [...this.scopes.values()].filter(scope => scope.members.includes(caller.id) && (input.scopeId === undefined || scope.id === input.scopeId)).flatMap(scope =>
+      Object.values(scope.operations).filter(op => execution && execution.claimed.has(op.id) && execution.requestOperations.has(op.id) && op.target === caller.id && op.sender !== caller.id && !op.control &&
+        (input.taskId === undefined || op.taskId === input.taskId) && (input.taskRevision === undefined || op.taskRevision === input.taskRevision) &&
+        (input.operationId === undefined || op.id === input.operationId) && op.execution === execution.id && op.requestInclusion?.execution === execution.id &&
+        op.status === 'admitted' && (op.intent === 'task' || op.intent === 'steer')).map(op => ({ scope, op })))
+    if (candidates.length !== 1) throw new Error('result requires one unambiguous task operation in the current native model request; select the exact native task/operation when multiple inputs are present: ' +
+      JSON.stringify(candidates.map(({ scope, op }) => ({ scopeId: scope.id, taskId: op.taskId, taskRevision: op.taskRevision, operationId: op.id, objective: scope.tasks[op.taskId]?.objective }))))
+    const { scope, op } = candidates[0]!
+    return { ...input, scopeId: scope.id, taskId: op.taskId, taskRevision: op.taskRevision, operationId: op.id }
+  }
+
+  async result(raw: CollaborationResultInput, exec: CollaborationExecution): Promise<CollaborationResult> {
+    const caller = this.caller(exec), input = await this.resultBinding(raw, caller)
     await this.settled(input.scopeId)
     const scope = this.scope(input.scopeId, caller), task = this.task(scope, input.taskId)
     this.member(scope, task, caller)
-    const operation = scope.operations[text(input.operationId, 'operationId')]
+    const operationId = input.operationId
+    const operation = scope.operations[text(operationId, 'operationId')]
     if (!operation || operation.target !== caller.id || operation.taskId !== task.id || operation.taskRevision !== input.taskRevision || operation.intent === 'result' || operation.intent === 'context') throw new Error('result must answer this session’s exact task operation and revision')
     const resultId = input.resultId ?? identity('result-', operation.id)
-    const value = text(input.text, 'text'), evidence = input.evidence ?? []
+    const value = bodyText(input.text, 'text'), evidence = input.evidence ?? []
     if (!Array.isArray(evidence) || evidence.some(item => typeof item !== 'string' || !item.trim())) throw new Error('invalid evidence references')
     if (scope.results[resultId]) {
       const prior = scope.results[resultId]!
@@ -594,7 +646,8 @@ export class CollaborationRuntime {
       const { verifyCollaborationArtifacts } = await import('./collaboration-materials.ts')
       const verified = await verifyCollaborationArtifacts(source.ctx, recipient.ctx, operation.artifacts as unknown as import('./collaboration-materials.ts').CollaborationArtifact[], exec.signal)
       this.caller(exec)
-      if (verified.some(item => item.status !== 'verified')) throw new Error('artifact version changed or is unavailable; inspect and obtain current evidence before finish')
+      const invalid = verified.filter(item => item.status !== 'verified')
+      if (invalid.length) throw new Error('artifact version changed or is unavailable for resultId=' + id + ', operationId=' + operation.id + ': ' + JSON.stringify(invalid.map(item => ({ path: item.artifact.sourcePath, status: item.status }))) + '. Inspect the changed or unavailable sources first. revalidate only associates business evidence with a task revision; it does not refresh immutable attachments. If current-version review is still required within the approved task, use collaboration_send with the current materials for a new read-only review operation, then finish with its fresh resultId. Preserve the old evidence and do not repeat already completed business side effects.')
       const current = this.scopes.get(scope.id)!
       if (current.tasks[result!.taskId]!.revision !== scope.tasks[result!.taskId]!.revision || !isDeepStrictEqual(current.operations[operation.id]!.artifacts, operation.artifacts)) throw new Error('task or artifact version changed during completion verification')
     }
@@ -642,8 +695,10 @@ export class CollaborationRuntime {
     const id = identity('mutation-', scope.id, text(exec.callId, 'callId'))
     if (scope.mutations[id]) return structuredClone(scope)
     const kind = input.action as 'edit' | 'withdraw'
-    const edited = kind === 'edit' ? this.message(scope, { ...operation, wire: undefined, text: text(input.message, 'message') }) : undefined
-    const after = edited && operation.wire ? { ...edited, content: [...edited.content, ...structuredClone(operation.wire.content.slice(1))] } : edited
+    const editedBody = kind === 'edit' ? bodyText(input.message, 'message') : undefined
+    const edited = kind === 'edit' ? this.message(scope, { ...operation, wire: undefined, text: editedBody! }) : undefined
+    const materialOffset = operation.wire?.source.kind === 'session-collaboration' && operation.wire.source.presentationVersion === 2 ? 2 : 1
+    const after = edited && operation.wire ? { ...edited, content: [...edited.content, ...structuredClone(operation.wire.content.slice(materialOffset))] } : edited
     const mutation: CollaborationQueueMutation = { id, operationId: operation.id, kind, status: 'prepared', before: this.message(scope, operation), ...(after ? { after } : {}) }
     await this.approval(exec, { ...input, objective: scope.objective, members: scope.members, operation: operation.id }, 'session_coordinator_collaboration_control')
     await this.change(scope.id, next => { this.running(next, this.task(next, task.id, task.revision)); next.mutations[id] = mutation })
@@ -668,7 +723,7 @@ export class CollaborationRuntime {
         if (applied) {
           const op = next.operations[operation.id]!
           if (kind === 'withdraw') op.status = 'withdrawn'
-          else { op.text = input.message!.trim(); op.wire = after! }
+          else { op.text = editedBody!; op.wire = after! }
         }
       })
     } catch (error) {
@@ -911,11 +966,16 @@ export class CollaborationRuntime {
         const agent = runtime.env.ctx.agents.get(request.sessionId as never) as unknown as LiveAgentLike | undefined
         const execution = agent && runtime.executions.get(agent)
         await Promise.all([...runtime.chains.values()])
-        if (agent && execution && runtime.env.ctx.agents.get(agent.id as never) === agent) for (const scope of runtime.scopes.values()) {
-          const included = Object.values(scope.operations).filter(op => op.target === agent.id && op.status === 'admitted' && !op.requestInclusion && request.messages.some((message: UserMessage) => message.id === op.id && isDeepStrictEqual(message, runtime.message(scope, op))))
-          if (included.length) await runtime.change(scope.id, current => {
-            for (const op of included) current.operations[op.id]!.requestInclusion = { evidence: 'native-llm-stream', execution: execution.id, step: execution.step, time: Date.now() }
-          })
+        if (agent && execution && runtime.env.ctx.agents.get(agent.id as never) === agent && runtime.executions.get(agent) === execution) {
+          execution.requestOperations = new Set()
+          for (const scope of runtime.scopes.values()) {
+            const included = Object.values(scope.operations).filter(op => op.target === agent.id && op.status === 'admitted' && request.messages.some((message: UserMessage) => message.id === op.id && isDeepStrictEqual(message, runtime.message(scope, op))))
+            for (const op of included) execution.requestOperations.add(op.id)
+            const unobserved = included.filter(op => op.requestInclusion?.execution !== execution.id)
+            if (unobserved.length) await runtime.change(scope.id, current => {
+              for (const op of unobserved) current.operations[op.id]!.requestInclusion = { evidence: 'native-llm-stream', execution: execution.id, step: execution.step, time: Date.now() }
+            })
+          }
         }
       }
       yield* next()
@@ -952,7 +1012,7 @@ export class CollaborationRuntime {
           }).catch(error => console.warn('[session-coordinator] approval observation could not persist:', errorText(error)))
         }
       }
-      if (event.type === 'turn/start') this.executions.set(agent, { id: `${this.instance(agent)}:${event.data.turn}`, turn: event.data.turn, step: 0, inputs: new Map(), claimed: new Set() })
+      if (event.type === 'turn/start') this.executions.set(agent, { id: `${this.instance(agent)}:${event.data.turn}`, turn: event.data.turn, step: 0, inputs: new Map(), claimed: new Set(), requestOperations: new Set() })
       if (event.type === 'step/start' || event.type === 'step/end') { const execution = this.executions.get(agent); if (execution) execution.step = event.data.step }
       if (event.type === 'turn/end' && this.executions.get(agent)?.turn === event.data.turn) {
         if (event.data.reason?.kind === 'error') executionError(agent, event.data.turn, event.data.reason.error)

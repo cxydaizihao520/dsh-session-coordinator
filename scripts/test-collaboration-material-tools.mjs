@@ -29,7 +29,7 @@ test('registered material tools recover task checkpoints and fork once without c
     const scope = await run('start', { objective: 'Deliver reviewed work', members: ['B', 'C'] })
     const task = await run('task', { scopeId: scope.id, objective: 'one task', members: ['B'] })
     const common = { scopeId: scope.id, taskId: task.id }
-    const checkpoint = await run('material', { ...common, action: 'checkpoint', sourceSessionId: 'B', constraints: ['keep source'], decisions: ['use native'], pending: ['verify'] })
+    const checkpoint = await run('material', { ...common, action: 'checkpoint', sourceSessionId: 'member:2', constraints: ['keep source'], decisions: ['use native'], pending: ['verify'] })
     const read = await run('material', { ...common, action: 'read-context', contextId: checkpoint.contextId }, 'B')
     assert.match(read.summary, /verify/)
     assert.equal(read.checkpoint.context.taskRevision, 1)
@@ -48,14 +48,15 @@ test('registered material tools recover task checkpoints and fork once without c
     let entered, release
     const started = new Promise(resolve => { entered = resolve }), finish = new Promise(resolve => { release = resolve })
     services.worktrees = { create: async () => { entered(); await finish; return { path: '/scratch/B', repositoryRoot: '/scratch', baseCommit: 'a'.repeat(40), branch: 'work' } } }
-    const worktree = run('material', { ...common, action: 'worktree', sessionId: 'B' })
+    await assert.rejects(run('material', { ...common, action: 'checkpoint', sourceSessionId: 'member:3' }), /outside this task/)
+    const worktree = run('material', { ...common, action: 'worktree', sessionId: 'member:2' })
     await started
     const second = await run('task', { scopeId: scope.id, objective: 'another task', members: ['B'] })
     await assert.rejects(run('material', { scopeId: scope.id, taskId: second.id, action: 'worktree', sessionId: 'B' }), /checkout/)
     release(); assert.equal((await worktree).ownerSessionId, 'B')
     assert.equal((await run('status', { scopeId: scope.id })).tasks[task.id].environments.B.path, '/scratch/B')
     await run('control', { ...common, action: 'pause', reason: 'hold' })
-    await assert.rejects(run('material', { ...common, action: 'fork', sourceSessionId: 'B' }), /active|paused/)
+    await assert.rejects(run('material', { ...common, action: 'fork', sourceSessionId: 'member:2' }), /active|paused/)
     await run('control', { ...common, action: 'resume', reason: 'Exercise late native fork result' })
     let forkEntered, forkRelease
     const forkStarted = new Promise(resolve => { forkEntered = resolve }), forkGate = new Promise(resolve => { forkRelease = resolve })

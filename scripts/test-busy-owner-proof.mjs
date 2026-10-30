@@ -69,3 +69,18 @@ test('an invented result operation ID followed by successful recovery cannot hid
   value.scope.results.result.operationId = 'invented-result-operation'
   assert.throws(() => verify(value), 'Only the original admitted operation can own the result')
 })
+
+// The protocol changes presentation, not the evidence required for a real busy turn.
+test('versioned presentation keeps exact business text and native busy-request evidence', () => {
+  const value = sample(), message = value.report.inboundResults[0].message
+  const originalSource = JSON.stringify(message.source)
+  message.source.presentationVersion = 2; message.source.senderTitle = '独立商品核算'
+  const old = message.content[0].text
+  const context = old.slice(0, -(value.scope.results.result.text.length + 1)).replace('[协作 ' + originalSource + '；', '[协作 ' + JSON.stringify(message.source) + '；')
+  message.content = [{ type: 'text', text: value.scope.results.result.text }, { type: 'text', text: context }]
+  value.report.requestInclusions[0].message = structuredClone(message)
+  verify(value)
+  message.content[0].text += '\n混入执行上下文'
+  value.report.requestInclusions[0].message = structuredClone(message)
+  assert.throws(() => verify(value), /canonical business result/)
+})

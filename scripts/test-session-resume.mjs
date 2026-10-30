@@ -100,7 +100,7 @@ test('concurrent same-target cold resumes share one writer; conflicting model ov
   await failed.run(); assert.equal(failed.calls.length, 2)
 })
 
-test('installed native projection wire next and internal pending remain distinct during resume setup', { skip: !existsSync(fileURLToPath(new URL('../tools/asar.mjs', import.meta.url))) || !existsSync('/Applications/DeepSeek Harness.app/Contents/Resources/app.asar') }, async () => {
+test('installed native projection wire next and internal pending remain distinct during resume setup', { skip: !existsSync('/Applications/DeepSeek Harness.app/Contents/Resources/app.asar') }, async () => {
   // Execute the installed official projection; do not recreate its reducer or wire shape in the test.
   let source = execFileSync(process.execPath, [fileURLToPath(new URL('../tools/asar.mjs', import.meta.url)), 'cat', '/dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/types/model-selection-projection.js'], { encoding: 'utf8' })
   source = source.replace("from 'zod'", 'from ' + JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('zod')).href))

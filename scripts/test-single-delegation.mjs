@@ -138,4 +138,85 @@ await test('repeated panel request after reload cannot silently redeliver; deliv
  const originalWarn=console.warn;console.warn=()=>{}
  try {const sent=await f.run('send',{sessionId:'B',message:'task'});assert.equal(sent.accepted,true);assert.equal(f.effects.filter(e=>e[0]==='send').length,1)}finally{console.warn=originalWarn}
 })
+
+
+await test('diagnostics retain legacy attempt hops including terminal refusal without business text', async()=>{
+ const { exportDiagnostics }=await import('../src/diagnostics.ts')
+ const h=fixture();const first=await h.run('send',{sessionId:'B',message:'PRIVATE-business-task'})
+ const reply=await h.run('send',{sessionId:'A',message:'PRIVATE-business-result',replyTo:first.messageId},'B')
+ await assert.rejects(h.run('send',{sessionId:'B',message:'PRIVATE-third-attempt'}),/terminal/)
+ const before=h.effects.length, packageA=await exportDiagnostics(h.ctx,'A',['B'])
+ assert.equal(h.effects.length,before,'export must not send or load agents')
+ const rows=packageA.sessions.flatMap(s=>s.records)
+ const denied=rows.find(r=>r.stage==='hop-check'&&r.attemptedHop===3)
+ assert.ok(denied);assert.equal(denied.parentHop,2);assert.equal(denied.hopLimit,2)
+ assert.equal(denied.rootMessageId,first.rootMessageId);assert.equal(denied.delivery,'not-sent')
+ assert.ok(rows.some(r=>r.stage==='accepted'&&r.messageId===reply.messageId&&r.hopCount===2))
+ assert.ok(rows.some(r=>r.stage==='failed'&&r.reason==='legacy-terminal'))
+ assert.ok(!JSON.stringify(packageA).includes('PRIVATE-'))
+ assert.equal(packageA.sessions[0].persistence,'flushed')
+})
+await test('diagnostics export survives native persistence without resuming or restoring reply authority',async()=>{
+ const { exportDiagnostics }=await import('../src/diagnostics.ts')
+ const h=fixture();await h.run('send',{sessionId:'B',message:'business'})
+ h.agents.delete('A')
+ const exported=await exportDiagnostics(h.ctx,'B',['A'])
+ assert.ok(exported.sessions.find(s=>s.sessionId==='A').records.some(r=>r.stage==='accepted'))
+ assert.equal(h.agents.has('A'),false)
+ assert.ok(h.effects.some(e=>e[0]==='close'&&e[1]==='A'))
+})
+await test('diagnostics storage failure cannot hide delivery outcome or leak error details',async()=>{
+ const h=fixture();h.setAnswer(async()=>{throw Error('approval unavailable PRIVATE-CREDENTIAL')})
+ const { exportDiagnostics }=await import('../src/diagnostics.ts')
+ await assert.rejects(h.run('send',{sessionId:'B',message:'PRIVATE-body'}),/PRIVATE-CREDENTIAL/)
+ const exported=await exportDiagnostics(h.ctx,'A')
+ assert.ok(!JSON.stringify(exported).includes('PRIVATE'))
+ assert.ok(exported.sessions[0].records.some(r=>r.stage==='failed'))
+ h.setAnswer(async()=> 'allowed-once');h.human('A')
+ h.setFlush(async session=>pluginRecordOf(session.snapshotEvents().at(-1))?.type!=='plugin:dsh-session-coordinator/diagnostic')
+ const result=await h.run('send',{sessionId:'B',message:'actual-delivery'})
+ assert.equal(result.accepted,true)
+ assert.equal((await exportDiagnostics(h.ctx,'A')).sessions[0].persistence,'unavailable')
+})
+
+await test('a transport exception cannot be mislabeled as a pre-send policy denial',async()=>{
+ const {exportDiagnostics}=await import('../src/diagnostics.ts');const h=fixture()
+ h.agents.get('B').steer=()=>{throw Error('approval rejected PRIVATE-after-submission')}
+ await assert.rejects(h.run('send',{sessionId:'B',message:'PRIVATE-business'}),/PRIVATE-after-submission/)
+ const dump=await exportDiagnostics(h.ctx,'A'),rows=dump.sessions[0].records
+ assert.ok(rows.some(r=>r.stage==='submit-started'))
+ assert.equal(rows.find(r=>r.stage==='failed').delivery,'unknown')
+ assert.ok(!JSON.stringify(dump).includes('PRIVATE'))
+})
+
+
+await test('diagnostics retain unknown durability and manual post-submit failures',async()=>{
+ const {exportDiagnostics}=await import('../src/diagnostics.ts');const h=fixture()
+ h.setFlush(async session=>session.id!=='B')
+ const result=await h.run('send',{sessionId:'B',message:'PRIVATE-message'})
+ assert.equal(result.accepted,true,'preserve legacy live acceptance contract')
+ let dump=await exportDiagnostics(h.ctx,'A')
+ assert.ok(dump.sessions[0].records.some(r=>r.stage==='transport-returned'&&r.delivery==='unknown'))
+ assert.ok(!dump.sessions[0].records.some(r=>r.stage==='accepted'))
+ const other=fixture();other.agents.get('B').steer=()=>{throw Error('approval rejected PRIVATE-transport')}
+ const command=await other.env.delivery.fromCommand('A',JSON.stringify({requestId:'manual-unknown-1',sessionId:'B',mode:'steer',message:'PRIVATE-manual'}))
+ assert.equal(command.kind,'error')
+ dump=await exportDiagnostics(other.ctx,'A')
+ assert.equal(dump.sessions[0].records.find(r=>r.stage==='failed').delivery,'unknown')
+ assert.ok(!JSON.stringify(dump).includes('PRIVATE'))
+})
+
+
+await test('pre-submit cancellation and invalid targets are known not-sent attempts, never transport unknown',async()=>{
+ const {exportDiagnostics}=await import('../src/diagnostics.ts')
+ for(const args of [{sessionId:'/PRIVATE/path',message:'PRIVATE-body'},{sessionId:'B',message:'PRIVATE-body'}]){
+  const h=fixture(),cancelled=args.sessionId==='B'
+  await assert.rejects(h.run('send',args,'A',{signal:cancelled?AbortSignal.abort():new AbortController().signal}))
+  const rows=(await exportDiagnostics(h.ctx,'A')).sessions[0].records
+  const failed=rows.find(r=>['failed','cancelled'].includes(r.stage))
+  assert.ok(failed);assert.equal(failed.delivery,'not-sent')
+  assert.ok(!rows.some(r=>r.stage==='submit-started'))
+  assert.ok(!JSON.stringify(rows).includes('PRIVATE'))
+ }
+})
 console.log(count+' single-delegation groups passed')

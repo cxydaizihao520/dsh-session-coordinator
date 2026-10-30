@@ -43,7 +43,7 @@ export async function recordDelivery(ctx: Context, session: Session, evidence: D
   return true
 }
 
-async function ownEvents(ctx: Context, id: string, signal: AbortSignal): Promise<readonly SessionEvent[]> {
+export async function ownEvents(ctx: Context, id: string, signal: AbortSignal): Promise<readonly SessionEvent[]> {
   signal.throwIfAborted()
   const live = getLiveAgent(ctx, id)
   if (live !== undefined) {
