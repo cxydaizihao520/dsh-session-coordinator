@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-export const busyOwnerPrompt = '这是用户授权的隔离忙时收信协议验收：你是总控A，需要核对一张订单的商品与运费。使用session_coordinator_collaboration_start创建1个新的独立主会话“忙时订单·商品核算”，继承当前目录与模型。预算maxOperations=12,maxNoProgress=6,maxElapsedMs=240000，不设置token cap。创建1个task让B核算商品：3件每件19元、2件每件7元。send(intent=task)的正文必须要求B只调用acceptance_peer_gate和collaboration_result：先调用gate取得A已开始自身工作的同步凭证，然后自己计算商品总额，用result提交text恰为ITEMS_TOTAL=实际整数，并在evidence字符串数组中写计算过程（例如["3*19+2*7=71"]，不能传单个字符串），随后正常结束。派工正文必须明确告知B：result的scopeId、taskId、taskRevision、operationId都逐字引用收到这条任务消息的source对应字段；operationId是原任务source.operationId，不是新结果ID，不得另造或改写。你在send正文不要填另一个operationId，也不要提供虚构的结果操作ID或占位示例；以实际收到任务的source为准。B遇真实协议错误就如实停止，不读源码、不搜索、不调用额外工具补救；B不负责运费和整合。你send成功后立即调用acceptance_busy_work一次，处理你负责的运费账；这个真实工具会在执行期间保持忙碌直到B的真实result已提交。工具正常完成后，在下一步读取实际B回信及工具返回的运费，调用acceptance_busy_integrate传入itemsTotal、shipping和combined三个实际整数，把商品与运费合并。不能预先编造B的回信。integrate成功后，用收到的真实resultIds先finish task，再finish scope；这两次finish都必须传同一非空resultIds数组和reason。确认completed，向用户汇报商品、运费与合计。全程禁止调用status取回结果，禁止session_coordinator_wait、collaboration_wait、旧send/create、任何临时子代理或无关工具；如果工具结束后的模型输入没有B回信，必须如实停止报告，不能用status或其他渠道补救。不要请求额外人工消息，也不要中断当前工具去处理回信。'
+export const busyOwnerPrompt = '这是用户授权的隔离忙时收信协议验收：你是总控A，需要核对一张订单的商品与运费。使用session_coordinator_collaboration_start创建1个新的独立主会话“忙时订单·商品核算”，继承当前目录与模型。预算maxOperations=12,maxNoProgress=6,maxElapsedMs=240000，不设置token cap。创建1个task让B核算商品：3件每件19元、2件每件7元。send(intent=task)的正文必须要求B只调用acceptance_peer_gate和collaboration_result：先调用gate取得A已开始自身工作的同步凭证，然后自己计算商品总额，用result提交text恰为ITEMS_TOTAL=实际整数，并在evidence字符串数组中写计算过程（例如["3*19+2*7=71"]，不能传单个字符串），随后正常结束。B正常仅提交result的text和evidence，运行时会从其当前原生模型请求绑定唯一派工；不要从业务正文构造关联ID。B遇真实协议错误就如实停止，不读源码、不搜索、不调用额外工具补救；B不负责运费和整合。你send成功后立即调用acceptance_busy_work一次，处理你负责的运费账；这个真实工具会在执行期间保持忙碌直到B的真实result已提交。工具正常完成后，在下一步读取实际B回信及工具返回的运费，调用acceptance_busy_integrate传入itemsTotal、shipping和combined三个实际整数，把商品与运费合并。不能预先编造B的回信。integrate成功后，用收到的真实resultIds先finish task，再finish scope；这两次finish都必须传同一非空resultIds数组和reason。确认completed，向用户汇报商品、运费与合计。全程禁止调用status取回结果，禁止session_coordinator_wait、collaboration_wait、旧send/create、任何临时子代理或无关工具；如果工具结束后的模型输入没有B回信，必须如实停止报告，不能用status或其他渠道补救。不要请求额外人工消息，也不要中断当前工具去处理回信。'
 
 /** Verify native behavior, not prompt text: a real peer result releases A's actual tool. */
 export function verifyBusyOwnerProof(report, scope) {
@@ -29,9 +29,13 @@ export function verifyBusyOwnerProof(report, scope) {
   assert.equal(inbound.length, 1, 'actual result must be admitted into A history')
   if (notification[0].requestInclusion) assert.equal(notification[0].requestInclusion.evidence, 'native-llm-stream')
   const expectedSource = { kind: 'session-collaboration', scopeId: scope.id, taskId: task.id, taskRevision: task.revision, operationId: notification[0].id, senderSessionId: report.sessions.B, ownerSessionId: report.sessions.A, intent: 'result' }
-  assert.deepEqual(inbound[0].message.source, expectedSource)
-  const expectedText = `来自会话 ${result.sender} · 协作结果\n[协作 ${JSON.stringify(expectedSource)}；结果已记录。根据当前任务及证据决定下一步、返工或调用 collaboration_control finish；不要仅为确认收信回复。]\n协作目标：${scope.objective}\n当前任务：${task.objective}\n${result.text}`
-  assert.deepEqual(inbound[0].message.content, [{ type: 'text', text: expectedText }], 'the exact canonical business result must belong to this persisted scope and task')
+  const { presentationVersion, senderTitle, ...identity } = inbound[0].message.source
+  assert.deepEqual(identity, expectedSource)
+  assert.ok(presentationVersion === undefined || presentationVersion === 2)
+  if (senderTitle !== undefined) assert.ok(presentationVersion === 2 && typeof senderTitle === 'string' && senderTitle.trim() && !/[\r\n]/.test(senderTitle))
+  const expectedText = `来自会话 ${result.sender} · 协作结果\n[协作 ${JSON.stringify(inbound[0].message.source)}；结果已记录。根据当前任务及证据决定下一步、返工或调用 collaboration_control finish；不要仅为确认收信回复。]\n协作目标：${scope.objective}\n当前任务：${task.objective}\n${result.text}`
+  const expectedContent = presentationVersion === 2 ? [{ type: 'text', text: result.text }, { type: 'text', text: expectedText.slice(0, -(result.text.length + 1)) }] : [{ type: 'text', text: expectedText }]
+  assert.deepEqual(inbound[0].message.content, expectedContent, 'the exact canonical business result must belong to this persisted scope and task')
   if (notification[0].wire) assert.deepEqual(inbound[0].message, notification[0].wire)
   const milestones = name => report.timeline.filter(item => item.name === name)
   for (const name of ['busy-start', 'peer-result', 'busy-release', 'busy-end', 'integrate']) assert.equal(milestones(name).length, 1, name)

@@ -36,7 +36,7 @@ test('scoped tasks bind the actual target before native queue delivery and flush
   h.ctx.sessions.flush = async session => { calls.push(session.id); return true }
   const sent = await h.run({ beforeSubmit: agent => { assert.equal(agent, target); assert.equal(agent.wakes, 0) } })
   assert.equal(sent.messageId, 'op-1'); assert.equal(target.wakes, 1)
-  assert.equal(target.inbox.nextTurn[0], h.message); assert.deepEqual(calls, ['B'])
+  assert.equal(target.inbox.nextTurn[0], h.message); assert.deepEqual(calls.filter(id => id === 'B'), ['B']); assert.equal(calls[0], 'B', 'actual target durability precedes optional caller diagnostics')
 })
 
 test('scope validation and cancellation fail before native delivery', async () => {

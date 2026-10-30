@@ -25,7 +25,7 @@ function harness(seed = [], providedStore) {
   const ready = installCollaboration({ ctx, delivery, registry: { record() {} } }, { store })
   let call = 0
   const run = async (name, args, caller = 'A', callId) => { await ready; return tools.get('session_coordinator_collaboration_' + name).execute(args, { agent: agents.get(caller), signal: new AbortController().signal, callId: callId ?? 'call-' + ++call }) }
-  return { async stream(options) { let next = async function* () {}; for (const fn of [...(listeners.get('llm/stream') ?? [])].reverse()) { const inner = next; next = () => fn(options, inner) } for await (const _chunk of next()) {} }, async dispatch(name, ...args) { for (const fn of listeners.get(name) ?? []) await fn(...args) }, ctx, delivery, clock, store, ready, tools, agents, emit, submissions, approvals, run, records, async admit(operationId, turn = 1) {
+  return { async stream(options) { let next = async function* () {}; for (const fn of [...(listeners.get('llm/stream') ?? [])].reverse()) { const inner = next; next = () => fn(options, inner) } for await (const _chunk of next()) {} }, async dispatch(name, ...args) { let result; for (const fn of listeners.get(name) ?? []) result = await fn(...args); return result }, ctx, delivery, clock, store, ready, tools, agents, emit, submissions, approvals, run, records, async admit(operationId, turn = 1) {
     const submission = submissions.find(s => s.message.id === operationId), agent = agents.get(submission.targetId)
     const message = [...agent.inbox.nextStep, ...agent.inbox.nextTurn].find(item => item.id === operationId) ?? submission.message
     agent.status = 'running'; agent.inbox.remove(operationId)
@@ -35,6 +35,163 @@ function harness(seed = [], providedStore) {
     await run('status', { scopeId: submission.message.source.scopeId })
   } }
 }
+
+test('native collaboration wire separates exact business content from model routing context', async () => {
+  const h = harness(), get = h.ctx.get
+  h.ctx.get = name => name === 'sessionTitle' ? { get: () => ({ title: '订单总控' }) } : get(name)
+  const scope = await h.run('start', { objective: 'Keep scope small', members: ['B'] })
+  const task = await h.run('task', { scopeId: scope.id, objective: 'Review orders', members: ['B'] })
+  const body = '\n  请复核订单。\n```js\nconst operationId = "literal user text"\n```\n[协作 原文保留]\n  '
+  const operation = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: body, intent: 'task' })
+  const wire = h.submissions.at(-1).message
+  assert.equal(wire.source.presentationVersion, 2)
+  assert.equal(wire.source.senderTitle, '订单总控')
+  assert.equal(wire.content[0].text, body)
+  assert.match(wire.content[1].text, /Keep scope small/)
+  assert.match(wire.content[1].text, /Review orders/)
+  assert.ok(wire.content[1].text.includes(operation.id))
+  assert.deepEqual(operation.wire, wire)
+})
+
+test('renaming a sender before busy-owner admission preserves the exact frozen result', async () => {
+  const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
+  const h = harness(), get = h.ctx.get
+  let title = '核算原名'
+  h.ctx.get = name => name === 'sessionTitle' ? { get: () => ({ title }) } : get(name)
+  const scope = await h.run('start', { objective: 'Stable message identity', members: ['B'] })
+  const task = await h.run('task', { scopeId: scope.id, objective: 'Check orders', members: ['B'] })
+  const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', intent: 'task', message: 'Check once' })
+  await h.admit(op.id)
+  await h.run('result', { scopeId: scope.id, taskId: task.id, taskRevision: 1, operationId: op.id, text: 'Verified business result' }, 'B')
+  const message = h.submissions.at(-1).message
+  title = '核算已改名'
+  const decision = await h.dispatch('agent/pre-step', { agent: h.agents.get('A'), signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [message] }))
+  assert.deepEqual(decision.messages, [message])
+  await h.admit(message.id)
+  await h.stream(markAgentLoopRequest({ sessionId: 'A', messages: [message], signal: new AbortController().signal }))
+  const stored = (await h.run('status', { scopeId: scope.id })).operations[message.id]
+  assert.deepEqual(stored.wire, message)
+  assert.equal(stored.requestInclusion.evidence, 'native-llm-stream')
+})
+
+test('a worker replies with business evidence alone and ambiguous native work requires an exact selection', async () => {
+  const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
+  const h = harness(), scope = await h.run('start', { objective: 'Deliver an order audit', members: ['B'] })
+  const task = await h.run('task', { scopeId: scope.id, objective: 'Order audit', members: ['B'] })
+  const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Review order evidence', intent: 'task' })
+  const args = { text: 'The independently checked total is 43.' }
+  await assert.rejects(h.run('result', args, 'B'), /unambiguous.*native model request/)
+  await h.admit(op.id)
+  await assert.rejects(h.run('result', args, 'B'), /unambiguous.*native model request/)
+  const firstMessage = h.submissions.find(s => s.message.id === op.id).message
+  const include = messages => h.stream(markAgentLoopRequest({ sessionId: 'B', provider: 'fixture', model: 'fixture', messages, signal: new AbortController().signal }))
+  await include([firstMessage])
+  await include([{ id: 'unrelated-user-message', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Different current input after compaction' }] }])
+  await assert.rejects(h.run('result', args, 'B'), /unambiguous.*native model request/)
+  await include([firstMessage])
+  const result = await h.run('result', args, 'B')
+  assert.equal(result.operationId, op.id); assert.equal(result.taskId, task.id)
+  assert.equal((await h.run('result', args, 'B')).id, result.id)
+  const other = await h.run('task', { scopeId: scope.id, objective: 'Freight audit', members: ['B'] })
+  const second = await h.run('send', { scopeId: scope.id, taskId: other.id, taskRevision: 1, sessionId: 'B', message: 'Check freight', intent: 'task' })
+  const message = h.submissions.find(s => s.message.id === second.id).message, agent = h.agents.get('B')
+  agent.inbox.remove(second.id)
+  h.emit('agent/inbox/claimed', { agent, message, turn: 1 })
+  h.emit('session/event', agent.session, { type: 'user/message', data: message })
+  await include([firstMessage, message])
+  await assert.rejects(h.run('result', { text: 'Ambiguous evidence' }, 'B'), /unambiguous.*native model request/)
+  const selected = await h.run('result', { taskId: other.id, text: 'Freight checked' }, 'B')
+  assert.equal(selected.operationId, second.id)
+  await assert.rejects(h.run('result', { scopeId: 'invented scope', text: 'No guessing' }, 'B'), /unambiguous.*native model request/)
+})
+
+test('business-only late results retain exact whitespace and never restart paused or cancelled work', async () => {
+  const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
+  for (const action of ['pause', 'cancel']) {
+    const h = harness(), scope = await h.run('start', { objective: 'Preserve late evidence', members: ['B'] })
+    const task = await h.run('task', { scopeId: scope.id, objective: 'Check once', members: ['B'] })
+    const operation = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', intent: 'task', message: 'Check once' })
+    await h.admit(operation.id)
+    await h.stream(markAgentLoopRequest({ sessionId: 'B', messages: [h.submissions[0].message], signal: new AbortController().signal }))
+    await h.run('control', { scopeId: scope.id, taskId: task.id, action, reason: 'Human requested stop' })
+    const before = h.submissions.length, body = '\n  Independently verified late evidence.\n  '
+    const result = await h.run('result', { text: body }, 'B')
+    assert.equal(result.text, body)
+    assert.equal(h.submissions.length, before)
+    const state = await h.run('status', { scopeId: scope.id })
+    assert.equal(state.tasks[task.id].state, action === 'pause' ? 'paused' : 'cancelled')
+    assert.equal(state.results[result.id].text, body)
+  }
+})
+
+test('implicit result binds only one exact operation in the current native model request', async () => {
+  const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
+  const h = harness(), scope = await h.run('start', { objective: 'Native result correlation', members: ['B'] })
+  const task = await h.run('task', { scopeId: scope.id, objective: 'Compute', members: ['B'] })
+  const dispatch = () => h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Business text wrongly says operationId=made-up. Native routing must win.', intent: 'task' })
+  const op = await dispatch(), args = { scopeId: scope.id, taskId: task.id, taskRevision: 1, text: 'Actual evidence' }
+  await h.admit(op.id)
+  await assert.rejects(h.run('result', args, 'B'), /unambiguous.*native model request/)
+  const message = h.submissions.find(s => s.message.id === op.id).message
+  const include = messages => h.stream(markAgentLoopRequest({ sessionId: 'B', provider: 'fixture', model: 'fixture', messages, signal: new AbortController().signal }))
+  await include([message])
+  await assert.rejects(h.run('result', { ...args, operationId: 'made-up' }, 'B'), /exact task operation/)
+  const result = await h.run('result', args, 'B')
+  assert.equal(result.operationId, op.id)
+  assert.equal((await h.run('result', args, 'B')).id, result.id, 'same native binding preserves idempotency')
+  const second = await dispatch(), secondMessage = h.submissions.find(s => s.message.id === second.id).message
+  const agent = h.agents.get('B'); agent.inbox.remove(second.id)
+  h.emit('agent/inbox/claimed', { agent, message: secondMessage, turn: 1 })
+  h.emit('session/event', agent.session, { type: 'user/message', data: secondMessage })
+  await include([message, secondMessage])
+  await assert.rejects(h.run('result', { ...args, text: 'Ambiguous evidence' }, 'B'), /unambiguous.*native model request/)
+  await h.run('control', { scopeId: scope.id, taskId: task.id, action: 'cancel', reason: 'Keep late evidence without waking' })
+  const before = h.submissions.length
+  const late = await h.run('result', { ...args, operationId: second.id }, 'B')
+  assert.equal(late.operationId, second.id)
+  assert.equal(h.submissions.length, before)
+  assert.equal((await h.run('status', { scopeId: scope.id })).tasks[task.id].state, 'cancelled')
+})
+
+test('member references never shadow an existing canonical session identity', async () => {
+  const h = harness(), original = h.agents.get('B')
+  h.agents.set('member:2', { ...original, id: 'member:2', session: { ...original.session, id: 'member:2', header: { id: 'member:2' } } })
+  const scope = await h.run('start', { objective: 'Preserve canonical identities', members: ['C', 'member:2'] })
+  const receipt = JSON.parse(h.tools.get('session_coordinator_collaboration_start').output.render({}, scope)[0].text)
+  const member = receipt.memberDirectory.find(entry => entry.sessionId === 'C')
+  const task = await h.run('task', { scopeId: scope.id, objective: 'Only C', members: [member.memberRef] })
+  assert.deepEqual(task.members, ['C'])
+  const sent = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: member.memberRef, message: 'Only C', intent: 'task' })
+  assert.equal(sent.target, 'C')
+  await assert.rejects(h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'member:2', message: 'Other canonical member', intent: 'task' }), /outside this task/)
+})
+
+test('scope member references reach exact approved recipients without reconstructing opaque IDs', async () => {
+  const h = harness()
+  const scope = await h.run('start', { objective: 'Review settlement', members: ['B', 'C', 'D'] })
+  const render = (name, value) => JSON.parse(h.tools.get('session_coordinator_collaboration_' + name).output.render({}, value)[0].text)
+  const directory = render('start', scope).memberDirectory
+  assert.ok(directory?.length, 'start must expose short member references')
+  const b = directory.find(entry => entry.sessionId === 'B')
+  const c = directory.find(entry => entry.sessionId === 'C')
+  const d = directory.find(entry => entry.sessionId === 'D')
+  const task = await h.run('task', { scopeId: scope.id, objective: 'Calculate', members: [b.memberRef, c.memberRef] })
+  assert.deepEqual(task.members, ['B', 'C'])
+  const operation = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: b.memberRef, message: 'Compute', intent: 'task' })
+  assert.equal(operation.target, 'B')
+  assert.equal(h.submissions.at(-1).targetId, 'B')
+  await assert.rejects(h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: d.memberRef, message: 'Outside task', intent: 'task' }), /outside this task/)
+  for (const invalid of ['member:0', 'member:02', 'member:99', 'cs-invented']) {
+    await assert.rejects(h.run('task', { scopeId: scope.id, objective: 'No fuzzy matching', members: [invalid] }), /approved scope/)
+  }
+  const foreign = await h.run('start', { objective: 'Other owner', members: ['D'] }, 'C')
+  await assert.rejects(h.run('task', { scopeId: foreign.id, objective: 'No cross-scope authority', members: [b.memberRef] }), /not authorized/)
+  const paused = await h.run('control', { scopeId: scope.id, taskId: task.id, action: 'pause', reason: 'Pause only this task' })
+  assert.equal(paused.tasks[task.id].state, 'paused')
+  assert.deepEqual(render('status', await h.run('status', { scopeId: scope.id })).memberDirectory, directory)
+  await assert.rejects(h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: b.memberRef, message: 'Must remain paused', intent: 'task' }), /not active/)
+  assert.equal(h.submissions.length, 1)
+})
 
 test('one scoped approval supports owner + N, two tasks and more than two rounds with correlated results', async () => {
   const h = harness()
@@ -759,10 +916,14 @@ test('registered material send persists native blocks and completion rejects cha
     h.agents.get('A').ctx = { get: name => name === 'fs' ? fs : undefined }; h.agents.get('B').ctx = { get: name => ({ fs, attachments })[name] }
     const task = await h.run('task', { scopeId: scope.id, objective: 'Use approved file', members: ['B'] })
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Read the attached requirement', intent: 'task', materials: [{ kind: 'file', path }] })
-    assert.equal(op.wire.content[1].type, 'file'); assert.equal(op.artifacts.length, 1)
-    const edited = await h.run('control', { scopeId: scope.id, taskId: task.id, action: 'edit', operationId: op.id, message: 'Read the same attachment with this correction', reason: 'Correct pending instruction' })
+    assert.equal(op.wire.content[2].type, 'file'); assert.equal(op.artifacts.length, 1)
+    const correction = '\n  Read the same attachment with this correction\n  '
+    const edited = await h.run('control', { scopeId: scope.id, taskId: task.id, action: 'edit', operationId: op.id, message: correction, reason: 'Correct pending instruction' })
     const pending = h.agents.get('B').inbox.nextTurn.find(message => message.id === op.id)
-    assert.deepEqual(pending.content.slice(1), op.wire.content.slice(1))
+    assert.equal(pending.content[0].text, correction)
+    assert.equal(edited.operations[op.id].text, correction)
+    assert.equal(pending.content.length, 3)
+    assert.deepEqual(pending.content.slice(2), op.wire.content.slice(2))
     assert.deepEqual(edited.operations[op.id].wire, pending)
     assert.deepEqual(edited.operations[op.id].artifacts, op.artifacts)
     assert.match(pending.content[0].text, /this correction/)
@@ -773,13 +934,30 @@ test('registered material send persists native blocks and completion rejects cha
     attachments.readImage = async ref => ({ ref, data: await readFile(imagePath) })
     const image = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Review image', intent: 'task', materials: [{ kind: 'image', path: imagePath, mediaType: 'image/png' }] })
     const imageEdit = await h.run('control', { scopeId: scope.id, taskId: task.id, action: 'edit', operationId: image.id, message: 'Review the same image carefully', reason: 'Clarify image instruction' })
-    assert.equal(imageEdit.operations[image.id].wire.content[1].type, 'image')
-    assert.deepEqual(imageEdit.operations[image.id].wire.content.slice(1), image.wire.content.slice(1))
+    assert.equal(imageEdit.operations[image.id].wire.content[2].type, 'image')
+    assert.deepEqual(imageEdit.operations[image.id].wire.content.slice(2), image.wire.content.slice(2))
     await h.admit(op.id)
     const result = await h.run('result', { scopeId: scope.id, taskId: task.id, taskRevision: 1, operationId: op.id, text: 'Delivered based on approved file' }, 'B')
     await writeFile(path, 'changed after result\n')
-    await assert.rejects(h.run('control', { scopeId: scope.id, taskId: task.id, action: 'finish', reason: 'Must verify actual current artifact', resultIds: [result.id] }), /artifact version changed/)
+    const finish = { scopeId: scope.id, taskId: task.id, action: 'finish', reason: 'Must verify actual current artifact', resultIds: [result.id] }
+    await assert.rejects(h.run('control', finish), error => {
+      assert.match(error.message, /artifact version changed/)
+      assert.ok(error.message.includes(result.id), 'identify the exact stale result')
+      assert.ok(error.message.includes(op.id), 'identify its immutable material operation')
+      assert.ok(error.message.includes(path), 'identify which source version changed')
+      return true
+    })
     assert.equal((await h.run('status', { scopeId: scope.id })).tasks[task.id].state, 'active')
+    await h.run('control', { ...finish, action: 'revalidate', reason: 'Reconsider business evidence, not the attachment snapshot' })
+    await assert.rejects(h.run('control', finish), /artifact version changed/, 'revalidate must not silently replace immutable material evidence')
+    const fresh = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Read-only review of the updated attached requirement; do not repeat completed side effects', intent: 'task', materials: [{ kind: 'file', path }] })
+    assert.notEqual(fresh.artifacts[0].sourceSha256, op.artifacts[0].sourceSha256)
+    await h.admit(fresh.id, 2)
+    const current = await h.run('result', { scopeId: scope.id, taskId: task.id, taskRevision: 1, operationId: fresh.id, text: 'Reviewed the changed requirement' }, 'B')
+    const completed = await h.run('control', { ...finish, resultIds: [current.id], reason: 'Accepted the freshly delivered and reviewed version' })
+    assert.equal(completed.tasks[task.id].state, 'completed')
+    assert.deepEqual(completed.tasks[task.id].acceptedResultIds, [current.id])
+    assert.deepEqual(completed.operations[op.id].artifacts, op.artifacts, 'the old material evidence remains immutable')
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -1119,4 +1297,60 @@ test('model control receipts keep queue mutation outcomes without replaying befo
   const withdrawal = JSON.parse(h.tools.get('session_coordinator_collaboration_control').output.render(withdrawArgs, withdrew)[0].text)
   assert.equal(withdrawal.operations[sent.id].status, 'admitted')
   assert.equal(Object.values(withdrawal.mutations).find(item => item.kind === 'withdraw').status, 'not-pending')
+})
+
+test('two real session logs correlate ten approved edit/test rounds and distinguish a denied scope', async () => {
+  const { Session } = await import('@deepseek-ai/dsh-session')
+  const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
+  const { exportDiagnostics } = await import('../src/diagnostics.ts')
+  const h = harness()
+  for (const id of ['A','B']) h.agents.get(id).session = Session.create(id, undefined, { version:4,id,createdAt:1,isSeeded:false,cwd:'/synthetic' })
+  h.ctx.sessions = { flush: async () => true }
+  const scope = await h.run('start', { objective:'PRIVATE-edit-test-business',members:['B'],budget:{maxOperations:100,maxNoProgress:20} })
+  const task = await h.run('task', { scopeId:scope.id,objective:'PRIVATE-fix-and-test',members:['B'] })
+  for (let n=1;n<=10;n++) {
+    const op = await h.run('send',{scopeId:scope.id,taskId:task.id,taskRevision:1,sessionId:'B',intent:'task',message:'PRIVATE-change-ready-'+n})
+    await h.admit(op.id,n)
+    await h.stream(markAgentLoopRequest({ sessionId:'B', messages:[h.submissions.find(s=>s.message.id===op.id).message],signal:new AbortController().signal }))
+    const result = await h.run('result',{text:'PRIVATE-test-evidence-'+n},'B')
+    assert.equal(result.operationId,op.id)
+  }
+  const dump = await exportDiagnostics(h.ctx,'A',['B']), rows=dump.sessions.flatMap(s=>s.records)
+  assert.equal(rows.filter(r=>r.tool==='session_coordinator_collaboration_send'&&r.stage==='returned').length,10)
+  assert.equal(rows.filter(r=>r.tool==='session_coordinator_collaboration_result'&&r.stage==='returned').length,10)
+  assert.ok(rows.every(r=>r.hopLimit===undefined),'persistent operations have budgets, not a fictional ten-hop cap')
+  assert.ok(rows.some(r=>r.scopeId===scope.id&&r.maxOperations===100))
+  assert.ok(!JSON.stringify(dump).includes('PRIVATE'))
+  h.ctx.get = name=> name==='approval'?{request:async()=> 'rejected'}:undefined
+  await assert.rejects(h.run('start',{objective:'PRIVATE-denied',members:['C']}),/not authorized/)
+  const denied=await exportDiagnostics(h.ctx,'A')
+  assert.ok(denied.sessions[0].records.some(r=>r.stage==='failed'&&r.reason==='authorization-denied'))
+})
+
+test('new scopes have no implicit handoff count cap; explicit caps and other guards remain separate', async () => {
+ const h=harness(),scope=await h.run('start',{objective:'Complete the task without a fixed round count',members:['B']})
+ assert.equal(scope.budget.maxOperations,undefined)
+ assert.equal(scope.budget.maxNoProgress,8)
+ assert.equal(scope.budget.maxElapsedMs,86400000)
+ const task=await h.run('task',{scopeId:scope.id,objective:'Produce successive test evidence',members:['B']})
+ for(let n=0;n<65;n++) {
+  const op=await h.run('send',{scopeId:scope.id,taskId:task.id,taskRevision:1,sessionId:'B',intent:'task',message:'Review change '+n})
+  await h.admit(op.id,n+1)
+  await h.run('result',{scopeId:scope.id,taskId:task.id,taskRevision:1,operationId:op.id,text:'Evidence '+n,evidence:['check:'+n]},'B')
+ }
+ const state=await h.run('status',{scopeId:scope.id})
+ assert.equal(state.state,'active')
+ assert.ok(h.submissions.length>=130)
+})
+
+test('task participants accept the already included owner without inventing or expanding any member',async()=>{
+ const h=harness(),scope=await h.run('start',{objective:'Owner implements; B tests',members:['B']})
+ const {collaborationMemberDirectory}=await import('../src/collaboration.ts')
+ const directory=collaborationMemberDirectory(scope)
+ const task=await h.run('task',{scopeId:scope.id,objective:'Same pair',members:directory.map(m=>m.memberRef)})
+ assert.deepEqual(task.members,['B'])
+ const canonical=await h.run('task',{scopeId:scope.id,objective:'Canonical same pair',members:['A','B']})
+ assert.deepEqual(canonical.members,['B'])
+ await assert.rejects(h.run('task',{scopeId:scope.id,objective:'Unknown must fail',members:['A','B','missing']}),/approved scope/)
+ await assert.rejects(h.run('task',{scopeId:scope.id,objective:'Owner only',members:['A']}),/at least one/)
 })

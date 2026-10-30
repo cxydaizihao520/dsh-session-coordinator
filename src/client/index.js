@@ -94,13 +94,18 @@ window.__ModuleLoader__.load({
       const sent = parseRecord(outcome.text)
       const select = asSelector(props.useSessions)
       const target = select((snapshot) => snapshot?.byId?.[request.sessionId])
+      if (/^logs(?:-related|\s|$)/.test(args) && outcome.kind === 'success' && sent.schemaVersion === 1 && Array.isArray(sent.sessions) && sent.businessContentIncluded === false) {
+        return h('div', { className: 'dsh-sc-card' }, h('style', null, CARD_CSS),
+          h('p', null, text('diagnostics.prepared')),
+          args === 'logs-related' ? null : h('details', null, h('summary', null, text('rawReceipt')), h('pre', null, JSON.stringify(sent, null, 2))))
+      }
       if (typeof request.sessionId !== 'string' || request.sessionId === '' ||
         typeof request.message !== 'string' || request.message === '' ||
         !['steer', 'queue'].includes(request.mode)) {
         return h('div', { className: 'dsh-sc-card' },
           h('style', null, CARD_CSS),
           h('p', null, 'coordinate · ', typeof outcome.text === 'string' && !outcome.text.trim().startsWith('{') ? outcome.text : text('status.unknown')),
-          h('details', null, h('summary', null, text('diagnostics')), h('pre', null, JSON.stringify(node, null, 2))))
+          h('details', null, h('summary', null, text('rawReceipt')), h('pre', null, JSON.stringify(node, null, 2))))
       }
       const entries = Array.isArray(history?.entries) ? history.entries : []
       const accepted = outcome.kind === 'success' && acceptedDelivery(request, sent)
@@ -157,9 +162,7 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dsh-sc-message' }, request.message),
           reply === undefined ? null : h('section', { 'aria-label': text('reply') },
             h('strong', null, text('reply')),
-            h('p', { className: 'dsh-sc-reply' }, body || text('replyEmpty'))),
-          h('details', null, h('summary', null, text('diagnostics')),
-            h('pre', null, JSON.stringify({ command: node, matchingReplies: replies.map(entry => entry.event) }, null, 2)))),
+            h('p', { className: 'dsh-sc-reply' }, body || text('replyEmpty')))),
       )
     }
 
@@ -272,17 +275,20 @@ window.__ModuleLoader__.load({
       const source = asRecord(data.source)
       const nonempty = value => typeof value === 'string' && value !== '' && !/[\r\n]/.test(value)
       if (source.kind === 'session-collaboration') {
+        const version = source.presentationVersion, offset = version === 2 ? 2 : 1
+        if (version !== undefined && version !== 2) return null
         if (data.role !== 'user' || !['scopeId', 'taskId', 'operationId', 'senderSessionId', 'ownerSessionId'].every(key => nonempty(source[key])) ||
           data.id !== source.operationId || !Number.isSafeInteger(source.taskRevision) || source.taskRevision < 1 ||
-          !['task', 'context', 'steer', 'result'].includes(source.intent) || !Array.isArray(data.content) || data.content.length === 0 ||
-          data.content.slice(1).some(block => !['file', 'image'].includes(block?.type) || !nonempty(block.attachment?.attachmentId) ||
+          !['task', 'context', 'steer', 'result'].includes(source.intent) || !Array.isArray(data.content) || data.content.length < offset ||
+          (version === 2 && (data.content[1]?.type !== 'text' || typeof data.content[1].text !== 'string')) ||
+          data.content.slice(offset).some(block => !['file', 'image'].includes(block?.type) || !nonempty(block.attachment?.attachmentId) ||
             !nonempty(block.attachment?.name) || !Number.isSafeInteger(block.attachment?.bytes) || block.attachment.bytes < 0) ||
           data.content[0]?.type !== 'text' || typeof data.content[0].text !== 'string') return null
-        const lines = data.content[0].text.split('\n')
+        const lines = data.content[offset - 1].text.split('\n')
         const label = { task: '协作任务', context: '协作信息', steer: '协作纠偏', result: '协作结果' }[source.intent]
         if (lines[0] !== '来自会话 ' + source.senderSessionId + ' · ' + label ||
           !lines[1]?.startsWith('[协作 ' + JSON.stringify(source) + '；') || !lines[1].endsWith(']')) return null
-        return { source, label: source.senderSessionId, body: lines.slice(2).join('\n'), message: data, event: event.pendingRecord ?? event }
+        return { source, label: typeof source.senderTitle === 'string' ? source.senderTitle : '', body: version === 2 ? data.content[0].text : lines.slice(2).join('\n'), message: data, event: event.pendingRecord ?? event }
       }
       if (data.role !== 'user' || source.kind !== 'session-message' ||
         !nonempty(source.senderSessionId) || !nonempty(source.messageId) || data.id !== source.messageId ||
@@ -349,35 +355,62 @@ window.__ModuleLoader__.load({
     }
 
     function ReceivedMessage(props) {
-      const data = props.node.data
-      const text = translator(props.t)
+      const data = props.node.data, text = translator(props.t)
+      const identity = props.node.id ?? data.message?.id ?? data.source.operationId ?? data.source.messageId
       const [copyState, setCopyState] = React.useState('')
+      const [expandedId, setExpandedId] = React.useState(null)
+      const [overflow, setOverflow] = React.useState(null)
+      const contentRef = React.useRef(null)
+      const expanded = expandedId === identity
+      const collapsible = overflow !== null && overflow.id === identity ? overflow.value : data.body.length > 320 || data.body.split('\n').length > 6
+      React.useEffect(() => {
+        const element = contentRef.current
+        if (!element || typeof ResizeObserver !== 'function') return
+        const measure = () => {
+          const limit = (parseFloat(getComputedStyle(element).fontSize) || 14) * 10
+          element.style.setProperty('--dsh-sc-preview-height', limit + 'px')
+          const value = element.scrollHeight > limit + 1
+          setOverflow(previous => previous?.id === identity && previous.value === value ? previous : { id: identity, value })
+        }
+        measure()
+        const observer = new ResizeObserver(measure)
+        observer.observe(element)
+        if (element.firstElementChild) observer.observe(element.firstElementChild)
+        return () => observer.disconnect()
+      }, [identity, data.body])
       const currentTitle = asSelector(props.useSessions)(snapshot => snapshot?.byId?.[data.source.senderSessionId]?.displayTitle)
-      const label = [currentTitle, data.label].find(value => typeof value === 'string' && value.trim() !== '' && value.trim() !== data.source.senderSessionId)
-      const materials = data.source.kind === 'session-collaboration' ? data.message?.content.slice(1) ?? [] : []
-      const plain = h('div', { className: 'dsh-sc-plain' }, data.body,
-        materials.length ? h('ul', null, ...materials.map((block, index) => h('li', { key: index }, block.attachment.name))) : null)
-      const body = typeof props.renderFactorySlot !== 'function' ? plain : materials.length
-        ? materials.some(block => block.type === 'image') && typeof props.loadImage !== 'function' ? plain
-          : props.renderFactorySlot('conversation.chat.user.content', { content: { text: data.body,
-            attachments: materials.map(block => block.type === 'file' ? { type: 'file', file: block.attachment } : { type: 'image', image: { attachment: block.attachment } }), extraBlocks: [] },
-            loadImage: props.loadImage, facts: {}, interactive: false }, { fallback: plain })
-        : props.renderFactorySlot('conversation.chat.reasoning.content', { text: data.body, running: false }, { fallback: plain })
+      const label = [currentTitle, data.label].find(value => typeof value === 'string' && value.trim() && value.trim() !== data.source.senderSessionId && !/[\r\n]/.test(value))
+      const materials = data.source.kind === 'session-collaboration' ? data.message?.content.slice(data.source.presentationVersion === 2 ? 2 : 1) ?? [] : []
+      const attachments = materials.map(block => block.type === 'file' ? { type: 'file', file: block.attachment } : { type: 'image', image: { attachment: block.attachment } })
+      const native = typeof props.renderFactorySlot === 'function'
+      const plain = h('div', { className: 'dsh-sc-bubble dsh-sc-plain' }, data.body)
+      const body = native ? props.renderFactorySlot('conversation.chat.user.content', { content: { text: data.body, attachments: [], extraBlocks: [] }, loadImage: props.loadImage, facts: {}, interactive: true }, { fallback: plain }) : plain
+      const materialFallback = attachments.length ? h('ul', null, ...materials.map((block, index) => h('li', { key: index }, block.attachment.name))) : null
+      const materialView = attachments.length && native && (!materials.some(block => block.type === 'image') || typeof props.loadImage === 'function') ?
+        props.renderFactorySlot('conversation.chat.user.content', { content: { text: '', attachments, extraBlocks: [] }, loadImage: props.loadImage, facts: {}, interactive: true }, { fallback: materialFallback }) : materialFallback
+      const recordedAt = typeof data.event?.time === 'number' ? new Date(data.event.time) : null
+      const timestamp = recordedAt && Number.isFinite(recordedAt.getTime()) ? recordedAt : null
       const copy = async () => {
         try { await props.copyText(data.body); setCopyState('copied') }
         catch { setCopyState('copyError') }
       }
-      const open = async id => {
-        try { await props.openTarget(id); setCopyState('') }
+      const open = async () => {
+        try { await props.openTarget(data.source.senderSessionId); setCopyState('') }
         catch { setCopyState('openError') }
       }
+      const sourceName = label?.trim() || text('sourceUnavailable')
+      const sourceLabel = h(React.Fragment, null, h(IconSend), text('receivedFrom') + sourceName)
       return h('section', { className: 'dsh-sc-received', 'aria-label': text('receivedMessage') },
         h('style', null, RECEIVED_CSS),
-        h('p', { className: 'dsh-sc-source' }, h(IconSend), text('receivedFrom') + (label?.trim() || text('sourceUnavailable'))),
-        h('div', { className: 'dsh-sc-bubble' }, body),
+        h('p', { className: 'dsh-sc-source' }, typeof props.openTarget === 'function' ? h('button', { type: 'button', 'aria-label': text('openSource') + ': ' + sourceName, onClick: open }, sourceLabel) : sourceLabel),
+        materialView,
+        h('div', { className: 'dsh-sc-text', ref: contentRef, 'data-collapsed': collapsible && !expanded ? 'true' : undefined }, body),
+        collapsible ? h('button', { type: 'button', className: 'dsh-sc-expand', 'aria-expanded': expanded, onClick: () => setExpandedId(expanded ? null : identity) }, text(expanded ? 'collapseBody' : 'expandBody')) : null,
         h('div', { className: 'dsh-sc-message-actions' },
-          h('button', { type: 'button', onClick: copy }, text('copyBody')),
-          typeof props.openTarget === 'function' ? h('button', { type: 'button', onClick: () => open(data.source.senderSessionId) }, text('openSource')) : null),
+          timestamp ? h('time', { dateTime: timestamp.toISOString(), title: timestamp.toLocaleString() }, timestamp.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })) : null,
+          h('button', { type: 'button', 'aria-label': text('copyBody'), title: text('copyBody'), onClick: copy },
+            h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, 'aria-hidden': true },
+              h('rect', { x: 8, y: 8, width: 12, height: 12, rx: 2 }), h('path', { d: 'M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3' })))),
         copyState === '' ? null : h('p', { role: 'status' }, text(copyState)))
     }
 
@@ -395,8 +428,15 @@ window.__ModuleLoader__.load({
       sourceUnavailable: '名称暂不可用',
       openError: '打开会话失败，请重试。',
       copyBody: '复制正文',
+      expandBody: '显示更多',
+      collapseBody: '收起',
       copied: '已复制正文',
       copyError: '复制失败，请选中正文复制。',
+      'diagnostics.prepared': '协作诊断已生成；不代表消息送达或任务完成。',
+      'diagnostics.export': '导出协作日志',
+      'diagnostics.started': '已开始下载',
+      'diagnostics.partial': '已开始下载；部分日志缺失或截断，详见文件',
+      'diagnostics.failed': '导出失败：请确认已加载支持日志的新插件，再重试',
       tooltip: '发送到会话',
       target: '目标会话',
       targetPlaceholder: '选择会话',
@@ -422,10 +462,10 @@ window.__ModuleLoader__.load({
       steer: '本轮插话',
       queueMode: '轮后排队',
       reply: 'B 的回信原文',
-      replyEmpty: '这封回信没有可显示的文字，请查看诊断详情。',
+      replyEmpty: '这封回信没有可显示的文字。',
       viewTarget: '查看会话',
       loadHistory: '补读 A 的历史',
-      diagnostics: '诊断详情',
+      rawReceipt: '原始回执',
       sendDetails: '发送详情',
       'receiving.unavailable': '聊天收信能力不可用，已保留原生呈现和消息原文；发送方可在发送详情查看关联回信。',
       'receiving.conflict': '其它插件也在处理聊天消息，已保留原生呈现和消息原文；发送方可在发送详情查看关联回信。',
@@ -462,8 +502,15 @@ window.__ModuleLoader__.load({
       sourceUnavailable: 'Name unavailable',
       openError: 'Could not open the chat. Try again.',
       copyBody: 'Copy message',
+      expandBody: 'Show more',
+      collapseBody: 'Show less',
       copied: 'Message copied',
       copyError: 'Could not copy. Select the message text to copy it.',
+      'diagnostics.prepared': 'Collaboration diagnostics prepared; this does not establish delivery or task completion.',
+      'diagnostics.export': 'Export collaboration logs',
+      'diagnostics.started': 'Download started',
+      'diagnostics.partial': 'Download started; some logs are missing or truncated',
+      'diagnostics.failed': 'Export failed: load the plugin version supporting diagnostics and retry',
       tooltip: 'Send to session',
       target: 'Target session',
       targetPlaceholder: 'Choose a session',
@@ -489,10 +536,10 @@ window.__ModuleLoader__.load({
       steer: 'During this turn',
       queueMode: 'After this turn',
       reply: 'Original reply from B',
-      replyEmpty: 'This reply has no displayable text. See diagnostics.',
+      replyEmpty: 'This reply has no displayable text.',
       viewTarget: 'View session',
       loadHistory: 'Load A history',
-      diagnostics: 'Diagnostics',
+      rawReceipt: 'Original receipt',
       sendDetails: 'Send details',
       'receiving.unavailable': 'Chat receiving capabilities are unavailable. Original rendering and messages are retained. Senders can read linked replies in Send details.',
       'receiving.conflict': 'Another plugin handles chat messages. Original rendering and messages are retained. Senders can read linked replies in Send details.',
@@ -737,7 +784,8 @@ window.__ModuleLoader__.load({
       '.dsh-sc-received .dsh-sc-source{display:flex;align-items:baseline;gap:6px;max-width:min(100%,68ch);margin:0 0 6px;color:var(--dsw-alias-label-primary);font-size:12px;font-weight:500;text-align:right;overflow-wrap:anywhere}',
       '.dsh-sc-received .dsh-sc-source svg{flex:none;align-self:center;color:var(--dsw-alias-state-business-primary)}',
       '.dsh-sc-received .dsh-sc-bubble{box-sizing:border-box;width:fit-content;max-width:min(100%,68ch);padding:10px 14px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-business-primary) 24%,transparent);border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-state-business-tertiary);color:var(--dsw-alias-label-primary);text-align:left;overflow-wrap:anywhere}',
-      // rc.3 compact Markdown 根是 div，显式用 tertiary 和次级字号；仅让自有气泡的根继承正文样式。
+      '.dsh-sc-received .dsh-sc-text{display:flex;flex-direction:column;align-items:flex-end;width:100%;min-width:0}.dsh-sc-received .dsh-sc-text[data-collapsed=true]{max-height:var(--dsh-sc-preview-height,10em);overflow:hidden}',
+      '.dsh-sc-received .dsh-sc-source button{display:flex;align-items:center;gap:6px;text-align:right}.dsh-sc-received .dsh-sc-expand{color:var(--dsw-alias-state-business-primary)}',
       '.dsh-sc-received .dsh-sc-bubble>div{color:inherit;font-size:inherit;line-height:inherit}',
       '.dsh-sc-received .dsh-sc-plain{white-space:pre-wrap}.dsh-sc-received .dsh-sc-bubble pre{max-width:100%;overflow:auto}',
       '.dsh-sc-received .dsh-sc-message-actions{display:flex;justify-content:flex-end;align-items:baseline;gap:12px;flex-wrap:wrap;max-width:100%;margin-top:6px;color:var(--dsw-alias-label-secondary);font-size:12px}',
@@ -863,241 +911,43 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // --- 按钮（conversation.input.left） --------------------------------------
-
-    function SendButton(props) {
-      const bridge = props.bridge
-      const state = useBridge(bridge)
+    function DiagnosticsButton(props) {
       const text = translator(props.t)
-      const label = text('tooltip')
-      const issue = asSelector(props.useReceivingStatus)(value => value)
-      const description = issue ? text(issue) : ''
-      return h(
-        'button',
-        {
-          type: 'button',
-          className: 'dsh-sc-button',
-          // 面板的"点外面就关"必须认这个锚点：否则点按钮会先被关、再被 click 打开。
-          'data-dsh-sc-anchor': 'send',
-          title: description ? label + ' · ' + description : label,
-          'aria-label': label,
-          'aria-description': description || undefined,
-          'aria-haspopup': 'dialog',
-          'aria-expanded': state.open ? 'true' : 'false',
-          onClick: (event) => {
-            if (bridge !== undefined && bridge !== null) bridge.toggle(event?.currentTarget)
-          },
-        },
-        h('style', { key: 'css' }, BUTTON_CSS),
-        h(IconWhale, { key: 'icon' }),
-      )
+      const [state, setState] = React.useState({})
+      const active = state.sessionId === props.sessionId ? state : {}
+      const inFlight = React.useRef(false)
+      return h('span', null,
+        h('button', { type: 'button', className: 'dsh-sc-button', style: { width: 'auto', padding: '0 8px', whiteSpace: 'nowrap' }, disabled: active.busy,
+          'aria-label': text('diagnostics.export'), title: text('diagnostics.export'),
+          onClick: async () => {
+            if (inFlight.current) return
+            inFlight.current = true
+            const sessionId = props.sessionId
+            setState({ sessionId, busy: true })
+            try {
+              const data = await props.exportDiagnostics(sessionId)
+              props.downloadDiagnostics(data)
+              const incomplete = data.sessions.some(row => row.incomplete !== false || row.truncated || row.total === 0) || data.discovery.truncated
+              setState({ sessionId, message: text(incomplete ? 'diagnostics.partial' : 'diagnostics.started') })
+            } catch {
+              setState({ sessionId, error: text('diagnostics.failed') })
+            } finally { inFlight.current = false }
+          } }, h('style', null, BUTTON_CSS), text('diagnostics.export')),
+        active.error ? h('span', { role: 'alert' }, active.error) : active.message ? h('span', { role: 'status' }, active.message) : null)
     }
 
-    // --- 面板（conversation.input.overlay） ------------------------------------
-
-    function SendPanel(props) {
-      const bridge = props.bridge
-      const state = useBridge(bridge)
-      const text = translator(props.t)
-      const receiving = asSelector(props.useReceivingStatus)(value => value)
-      const sessionId = props.sessionId
-      // useSessions / useWorkspaces 缺席时保持同样的 hook 调用次数，只让选择器恒返回 undefined。
-      const select = asSelector(props.useSessions)
-      const ids = select((snapshot) => (snapshot === undefined ? undefined : snapshot.ids))
-      const byId = select((snapshot) => (snapshot === undefined ? undefined : snapshot.byId))
-      const self = select((snapshot) => (snapshot === undefined || sessionId === undefined ? undefined : snapshot.byId[sessionId]))
-      // 归档标志只在宿主的 Workspace 快照里（会话行没有这个字段）：缺席就不猜。
-      const selectWorkspaces = asSelector(props.useWorkspaces)
-      const archivedIds = selectWorkspaces((snapshot) => (snapshot === undefined ? undefined : snapshot.archivedSessionIds))
-      const bodyRef = React.useRef(null)
-      const panelRootRef = React.useRef(null)
-      const candidates = React.useMemo(
-        () => candidatesOf({ ids, byId, self, archivedIds }),
-        [ids, byId, self, archivedIds],
-      )
-      const visibleCandidates = state.showArchived ? candidates : candidates.filter(candidate => !candidate.archived)
-
-      React.useEffect(() => {
-        if (state.open && bodyRef.current !== null && typeof bodyRef.current.focus === 'function') {
-          bodyRef.current.focus()
-        }
-      }, [state.open])
-
-      // 费用提示出现时「发送」按钮已不在原位，焦点接给「确认发送」——键盘用户
-      // 不会因此掉到页面开头，回个车就能确认。
-      React.useEffect(() => {
-        if (!state.open) return undefined
-        const onPointerDown = (event) => {
-          const target = event.target
-          if (!(target instanceof Element)) return
-          const root = panelRootRef.current
-          if (root !== null && root.contains(target)) return
-          if (target.closest('[data-dsh-sc-anchor]') !== null) return
-          if (bridge !== undefined && bridge !== null) bridge.close(false)
-        }
-        // Escape 只归面板：不拦下来的话，同一个按键会继续喂给宿主的"连按两次中断"
-        // 快捷键，关个面板等于给当前这轮上膛。
-        const onKeyDown = (event) => {
-          if (event.key !== 'Escape') return
-          event.preventDefault()
-          event.stopPropagation()
-          if (bridge !== undefined && bridge !== null) bridge.close()
-        }
-        document.addEventListener('pointerdown', onPointerDown, true)
-        document.addEventListener('keydown', onKeyDown, true)
-        return () => {
-          document.removeEventListener('pointerdown', onPointerDown, true)
-          document.removeEventListener('keydown', onKeyDown, true)
-        }
-      }, [state.open, bridge])
-
-      if (!state.open) return null
-
-      // 目标的三种状态决定发送按钮长什么样：已归档直接拦住（宿主会收下但整轮被
-      // gate 拦掉，不产生任何效果）；可能已关闭要先确认代价；在线就照常发。
-      const target = candidates.find((candidate) => candidate.id === state.targetId)
-      const archivedTarget = target !== undefined && target.archived
-      const coldTarget = target !== undefined && !target.archived && !target.online
-      // 单步：同一目标本次页面会话里提示过一次就不再提示（点过发送 = 已知代价）。
-      const showColdHint = coldTarget && !coldAcknowledged.has(state.targetId)
-      const ready = !state.busy && state.text.trim() !== '' && target !== undefined && !archivedTarget
-      // 候选为空有两种原因：真的没有别的会话，或读不到自己的 cwd（筛选条件不成立）。
-      const cwdKnown = typeof asRecord(self).cwd === 'string' && asRecord(self).cwd !== ''
-      const error = state.error === null ? '' : errorTextOf(state.error, text)
-      const warning = archivedTarget ? text('warn.archived') : target === undefined && state.targetId !== ''
-        ? text('warn.target-missing') : showColdHint ? text('warn.closed') : ''
-      const title = text('tooltip')
-      return h(
-        'div',
-        {
-          key: 'panel',
-          className: 'dsh-sc-panel',
-          role: 'dialog',
-          'aria-label': title,
-          ref: panelRootRef,
-          onMouseDown: (event) => event.stopPropagation(),
-        },
-        h('style', { key: 'css' }, PANEL_CSS),
-        receiving ? h('p', { className: 'dsh-sc-hint', role: 'status' }, text(receiving)) : null,
-        h(
-          'div',
-          { key: 'head', className: 'dsh-sc-head' },
-          h('span', { className: 'dsh-sc-title' }, title),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-sc-close',
-              title: text('close'),
-              'aria-label': text('close'),
-              onClick: () => bridge.close(),
-            },
-            h(IconClose),
-          ),
-        ),
-        h(
-          'select',
-          {
-            key: 'target',
-            className: 'dsh-sc-target',
-            'aria-label': text('target'),
-            value: visibleCandidates.some(candidate => candidate.id === state.targetId) ? state.targetId : '',
-            disabled: state.busy,
-            onChange: (event) => bridge.setTarget(event.target.value),
-          },
-          h('option', { value: '', key: '' }, text('targetPlaceholder')),
-          ...visibleCandidates.map((candidate) =>
-            h(
-              'option',
-              { value: candidate.id, key: candidate.id },
-              candidate.title +
-                (visibleCandidates.some(other => other.id !== candidate.id && other.title === candidate.title) ? ' · ' + candidate.id : '') +
-                ' · ' +
-                text(candidate.archived ? 'archived' : candidate.running ? 'running' : 'idle'),
-            ),
-          ),
-        ),
-        h('label', { key: 'archived', className: 'dsh-sc-queue' },
-          h('input', { type: 'checkbox', checked: state.showArchived, disabled: state.busy,
-            onChange: event => {
-              if (state.busy) return
-              if (!event.target.checked && archivedTarget) bridge.setTarget('')
-              bridge.setShowArchived(event.target.checked)
-            } }),
-          h('span', null, text('showArchived'))),
-        visibleCandidates.length === 0
-          ? h('p', { key: 'empty', className: 'dsh-sc-empty' }, text(!cwdKnown ? 'error.no-cwd' : candidates.length > 0 ? 'emptyFiltered' : 'empty'))
-          : null,
-        h('textarea', {
-          key: 'body',
-          ref: bodyRef,
-          className: 'dsh-sc-body',
-          rows: 3,
-          value: state.text,
-          placeholder: text('bodyPlaceholder'),
-          'aria-label': text('bodyPlaceholder'),
-          disabled: state.busy,
-          onChange: (event) => bridge.setText(event.target.value),
-        }),
-        h(
-          'label',
-          { key: 'queue', className: 'dsh-sc-queue' },
-          h('input', {
-            type: 'checkbox',
-            checked: state.queue,
-            disabled: state.busy,
-            onChange: (event) => bridge.setQueue(event.target.checked),
-          }),
-          h('span', null, text('queue')),
-        ),
-        h('label', { key: 'reply-handling', className: 'dsh-sc-queue' },
-          h('span', null, text('replyHandling')),
-          h('select', { className: 'dsh-sc-target', 'aria-label': text('replyHandling'),
-            value: state.replyHandling, disabled: state.busy,
-            onChange: event => bridge.setReplyHandling(event.target.value) },
-          h('option', { value: 'continue' }, text('replyContinue')),
-          h('option', { value: 'receive-only' }, text('replyReceiveOnly')))),
-        state.replyHandling === 'receive-only' ? h('p', { className: 'dsh-sc-hint' }, text('receiveOnlyHint')) : null,
-        h('p', { className: 'dsh-sc-empty' }, text('replyHint')),
-        warning === ''
-          ? null
-          : h(
-              'div',
-              { key: 'warn', className: 'dsh-sc-warn', role: archivedTarget ? 'alert' : 'status' },
-              warning,
-            ),
-        h(
-          'div',
-          { key: 'foot', className: 'dsh-sc-foot' },
-          error === '' ? h('span', { className: 'dsh-sc-grow' }) : h('span', { className: 'dsh-sc-error', role: 'alert' }, error),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-sc-secondary',
-              disabled: state.busy,
-              onClick: () => bridge.close(),
-            },
-            text('cancel'),
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-sc-primary',
-              disabled: !ready,
-              // 即便 disabled 在真实 DOM 里挡住了点击，也拦一道，避免失效目标投递。
-              onClick: () => {
-                if (!ready) return undefined
-                // 点过一次就算"已知代价"：同一目标本次页面会话里不再提示。
-                if (coldTarget) coldAcknowledged.add(state.targetId)
-                return bridge.send()
-              },
-            },
-            state.busy ? text('sending') : showColdHint ? text('sendReopen') : text('send'),
-          ),
-        ),
-      )
+    function downloadDiagnostics(data) {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+      const anchor = document.createElement('a')
+      try {
+        anchor.href = url
+        anchor.download = 'collaboration-diagnostics-' + Date.now() + '.json'
+        document.body.appendChild(anchor)
+        anchor.click()
+      } finally {
+        anchor.remove()
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
+      }
     }
 
     // --- 插件本体 -------------------------------------------------------------
@@ -1114,8 +964,7 @@ window.__ModuleLoader__.load({
      * `order` 决定同槽位内的先后（宿主内置项多为 0/1，我们排在后面）。
      */
     const SLOT_ENTRIES = [
-      { slot: 'conversation.input.left', id: BUTTON_ID, order: 60, Component: SendButton },
-      { slot: 'conversation.input.overlay', id: PANEL_ID, order: 60, Component: SendPanel },
+      { slot: 'conversation.session.header.utilities', id: 'collaboration-diagnostics', order: 60, Component: DiagnosticsButton },
       { slot: 'conversation.chat.node', key: RECEIVED_KIND, services: ['uiConversation'], definition: receivedDefinition, Component: ReceivedMessage },
       { slot: 'conversation.chat.commandview', key: 'coordinate', services: ['sessions', 'uiWorkspace'], Component: DelegationCard },
     ]
@@ -1198,7 +1047,17 @@ window.__ModuleLoader__.load({
             }
           }
           return scope.slots.register({ name: entry.slot, ...(entry.key === undefined ? { id: entry.id, order: entry.order } : { key: entry.key }), locale: NS,
-            inject: (sessionId) => entry.key === undefined ? { bridge: bridgeFor(sessionId), hooks: { receivingStatus } } : {
+            inject: (sessionId) => entry.key === undefined ? {
+              downloadDiagnostics,
+              exportDiagnostics: async (id) => {
+                const execution = await ctx.remote.commands.execute(id, '/coordinate logs-related', [])
+                const result = asRecord(asRecord(execution.value).result)
+                if (execution.ok !== true || result.kind !== 'success') throw new Error('diagnostics unavailable')
+                const data = JSON.parse(result.text)
+                if (data.schemaVersion !== 1 || data.businessContentIncluded !== false || !Array.isArray(data.sessions) || !data.discovery) throw new Error('diagnostics version unavailable')
+                return data
+              },
+            } : {
               bridge: bridgeFor(sessionId),
               hooks: { delegationEvents: scope.sessions.binding(sessionId)?.eventSource ?? ABSENT_EVENTS },
               openTarget: (id) => scope.uiWorkspace.openSession(id),

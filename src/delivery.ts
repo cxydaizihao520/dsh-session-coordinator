@@ -1,3 +1,4 @@
+import { recordDiagnostic, diagnosticCall } from './diagnostics.ts'
 /** 工具和人工面板共用的发送路径；回信权只来自本进程实际投递过的消息。 */
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
@@ -305,6 +306,7 @@ export class SessionDelivery {
     options.beforeSubmit?.(target)
     checkpoint(target)
     if (getLiveAgent(this.ctx, targetId) !== target) throw new Error('target changed before delivery')
+    void recordDiagnostic(this.ctx, caller.session, { ...(message.source as unknown as Record<string, unknown>), targetSessionId: targetId, protocol: 'persistent', messageId: message.id, stage: 'submit-started', delivery: 'unknown' })
     try {
       if (options.mode === 'context') await this.receiveOnly(target, message, 'steer')
       else if (options.mode === 'queue') target.followup(message)
@@ -313,6 +315,7 @@ export class SessionDelivery {
     } catch (error) {
       throw new InformationDeliveryError('scoped delivery outcome unknown: ' + (error instanceof Error ? error.message : String(error)), 'unknown')
     }
+    void recordDiagnostic(this.ctx, caller.session, { ...(message.source as unknown as Record<string, unknown>), targetSessionId: targetId, protocol: 'persistent', messageId: message.id, sinceSeq, stage: 'accepted', delivery: 'accepted' })
     return { messageId: message.id, sinceSeq }
   }
 
@@ -323,6 +326,12 @@ export class SessionDelivery {
 
   /** commands.execute 是现成的人工入口；不能把正文中的来源声明当成回信授权。 */
   async fromCommand(callerId: string, raw: string): Promise<CommandResult> {
+    let args: unknown
+    try { args = JSON.parse(raw) } catch { args = {} }
+    return diagnosticCall(this.ctx, getLiveAgent(this.ctx, callerId), 'coordinate.send', args, undefined, undefined, () => this.commandSend(callerId, raw))
+  }
+
+  private async commandSend(callerId: string, raw: string): Promise<CommandResult> {
     try {
       const input: unknown = JSON.parse(raw)
       if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new Error('invalid send request')
@@ -432,6 +441,9 @@ export class SessionDelivery {
 
     const replyTo = input.replyTo?.trim() || (humanRequestId === undefined && !information ? this.incomingReplyTo(caller) : undefined)
     const parent = replyTo === undefined ? undefined : this.messages.get(replyTo)
+    if (!information) void recordDiagnostic(this.ctx, caller.session, { stage: 'hop-check', protocol: 'legacy-single', targetSessionId: targetId, replyTo, rootMessageId: parent?.result.rootMessageId,
+      ...(parent ? { parentHop: parent.result.hopCount, attemptedHop: parent.result.hopCount + 1, terminal: parent.result.terminal } : replyTo === undefined ? { parentHop: 0, attemptedHop: 1 } : { reason: 'invalid-parent' }),
+      hopLimit: 2, ...(parent?.result.terminal ? { delivery: 'not-sent' } : {}) })
     const generation = this.revocations.get(parent?.sender ?? caller.id) ?? 0
     let grantBound = humanRequestId === undefined
     if (replyTo !== undefined) {
@@ -495,6 +507,7 @@ export class SessionDelivery {
       delivery.message = message
       this.messages.set(messageId, delivery)
       this.unattemptedInformation.delete(messageId)
+      void recordDiagnostic(this.ctx, caller.session, { ...result, targetSessionId: targetId, protocol: information ? 'information' : 'legacy-single', stage: 'submit-started', delivery: 'unknown' })
       try {
         if (information || parent !== undefined && replyHandling === 'receive-only') await this.receiveOnly(target, message, mode)
         else if (mode === 'queue') target.followup(message)
@@ -504,10 +517,11 @@ export class SessionDelivery {
         throw new InformationDeliveryError('information delivery outcome unknown: ' + (error instanceof Error ? error.message : String(error)), 'unknown')
       }
       delivery.committed = true
+      let durable = false
       if (parent !== undefined) parent.reply = { messageId, text }
       try {
         if (typeof this.ctx.sessions?.flush === 'function' && !await this.ctx.sessions.flush(target.session)) throw new Error('target has no durability listener')
-        await recordDelivery(this.ctx, caller.session, { version: 1, owner: caller.id, target: targetId, requestId: messageId, stage: 'delivered', text, message })
+        durable = await recordDelivery(this.ctx, caller.session, { version: 1, owner: caller.id, target: targetId, requestId: messageId, stage: 'delivered', text, message })
       } catch (error) {
         if (information) {
           delivery.committed = false
@@ -516,6 +530,7 @@ export class SessionDelivery {
         console.warn('[session-coordinator] delivered; recovery evidence incomplete:', error)
       }
       this.registry.touch(targetId)
+      void recordDiagnostic(this.ctx, caller.session, { ...result, targetSessionId: targetId, protocol: information ? 'information' : 'legacy-single', stage: durable ? 'accepted' : 'transport-returned', delivery: durable ? 'accepted' : 'unknown' })
       return result
     } catch (error) {
       if (parent !== undefined && parent.reply === undefined) parent.replied = false

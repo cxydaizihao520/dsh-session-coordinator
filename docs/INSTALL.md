@@ -1,80 +1,63 @@
 # 安装、升级与验证
 
-面向 DeepSeek Harness 使用者，以及受使用者授权代为安装的 Agent。当前源码试用分支为 `share/latest-source`，版本以 `package.json` 和安装后插件管理页为准。
+本手册适用于 **0.2.15 预览版**。安装后核对实际版本及组件状态，再运行下方协作例子。使用预构建包无需克隆源码或运行构建。
 
-## 首次安装
+## 首次安装与升级
 
-1. 检查本机环境：已安装 Harness；终端执行 `node --version`、`pnpm --version`、`dsh --help`。本版构建要求 Node **22.18+（22 系列）或 24.11+**，推荐当前 Node 24 LTS；pnpm 使用仓库 `packageManager` 指定版本。插件最低声明 Harness 0.2.1-rc.1，实际验证宿主为 0.2.1-rc.3。
+当前公开源码为 **0.2.15**，npm 包尚未正式发布。需要已安装 DeepSeek Harness；终端中运行 `dsh --help` 检查命令可用。macOS 找不到命令时，可在应用菜单中选择“管理 dsh 命令…”，或使用 `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`。
 
-   macOS 中找不到 `dsh` 时，可在 Harness 应用菜单选择“管理 dsh 命令…”配置命令；或在后续命令中用 `"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"` 替代 `dsh`。其他平台使用其本机安装提供的命令位置，尚未实机验证。
+```bash
+dsh plugin --profile desktop add 'git+https://github.com/cxydaizihao520/dsh-session-coordinator.git#main'
+```
 
-2. 在自己选择的源码目录克隆并构建；各命令成功后再执行下一条：
+Git 安装会获取源码并执行 prepare 构建，构建环境要求见下一节。若安装器要求批准构建，只批准它打印的准确包名及本次提交，不全局放行任意脚本。固定版本时，将命令中的 `#main` 替换为已核对的完整 Git 提交 SHA；升级时重新执行上述 main 命令并核对实际版本。
 
-   ```bash
-   git clone --branch share/latest-source https://github.com/cxydaizihao520/dsh-session-coordinator.git
-   cd dsh-session-coordinator
-   pnpm install --frozen-lockfile
-   pnpm typecheck
-   pnpm build
-   pnpm smoke
-   pnpm pack
-   ```
+安装到其他 profile 不会更新当前桌面实例。先处理运行中的任务，再正常重启应用；只刷新前端不能证明宿主已经换版。无需删除工作区或聊天。
 
-   完成条件：命令退出码均为 0，`lib/index.js` 存在，并生成 `dsh-session-coordinator-<版本>.tgz`。只有源码目录而没有构建产物，不能视为可安装。
+如果已经取得本版预构建文件，也可以从本地安装；本仓库当前没有声明已发布的 npm 或 Release 下载地址：
 
-3. 安装刚生成的包到桌面 profile：
+```bash
+dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.15.tgz
+```
 
-   ```bash
-   dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.8.tgz
-   ```
+本地预构建 tgz 无需 Git prepare 构建。待 npm 正式发布并验收后，才可使用按包名安装；当前不要运行尚未生效的 npm 包名命令。
 
-   版本升级后使用上一步真实生成的包名。安装到其他 profile 不会更新桌面实例。通过打包安装，桌面使用的是包快照；后续修改源码需要重新构建、打包和安装。
+在插件管理中核对插件和组件启用、实际版本为 `0.2.15`，然后进行下方真实协作验证。不要仅凭安装命令退出 0 就认定使用流程通过。
 
-4. 正常重启 Harness。先保存工作并处理运行中任务；如果应用提示退出将中断任务，由使用者决定等待或中断。安装授权不自动授权中断其他任务。
+## 从本候选源码构建
 
-5. 打开“插件 → dsh-session-coordinator”，核对版本为 **0.2.8**、插件及组件已启用。发送下面的试用任务，完成条件是实际出现指定独立会话并收到其结果；工具注册或版本号正确不等于任务已跑通。
+这部分仅面向开发者，需取得完整源码检出后执行，不能在 npm 安装目录中直接构建。使用 Node `22.18+`（22 系列）或 `24.11+`、pnpm `10.30.3`。构建工具要求高于插件清单中的 Node >=20。最低声明 Harness `0.2.1-rc.1`，跨版本实机结果以对应验收记录为准。
 
-   > 请新建一个独立主会话，命名“协作试用·核算”，与我当前会话持续协作：第一轮计算 17+26；收到真实结果后，再让同一个会话换一种方法复核；我当前会话核对后交付结论并结束这次协作。只联系这个新会话，不读写文件、不安装依赖。首次审批后允许任务内自动往返。
+在完整源码目录逐条执行：
 
-   首次原生范围审批显示协作目标、成员与预算；确认符合本任务后允许一次。后续轮次在已批准范围内继续。使用者明确拒绝、暂停、取消或预算用尽时，按实际状态停止处理。
+```bash
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm smoke
+pnpm pack
+dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.15.tgz
+```
 
-## 从旧版升级
+Git 来源安装可能需要为指定提交批准 prepare 构建；请仅允许安装器给出的准确包名及提交，不全局放行任意脚本。预构建 npm 包和 tgz 不运行本插件的 prepare 构建。
 
-**旧克隆迁移提示：** 2026-10-29 公开分支已重新建立为单提交历史。若本地仍是此前克隆，保留原目录，在另一个新目录按“首次安装”重新克隆、构建和安装即可；聊天及工作区无需删除。下面的快进更新步骤仅用于已迁移到新历史的干净克隆。遇到历史分叉时也采用新目录安装，不覆盖本地改动。
+## 安装后的真实验证
 
-1. 在原源码目录执行 `git status --short`。有本地改动时先保留或另选目录克隆；不要用 reset/clean 覆盖使用者文件。
-2. 工作树干净时执行：
+在一个测试聊天中输入：
 
-   ```bash
-   git fetch origin
-   git switch share/latest-source
-   git pull --ff-only origin share/latest-source
-   pnpm install --frozen-lockfile
-   pnpm typecheck
-   pnpm build
-   pnpm smoke
-   pnpm pack
-   dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.8.tgz
-   ```
+> 请新建一个独立会话“核算复核”，与当前会话持续协作。第一轮计算 17+26，收到真实结果后让同一个会话换一种方法复核；我当前会话核对两次结果，再完成这次任务与协作。只联系这个新会话，不读写文件、不安装依赖。本任务内允许自动往返，首次审批后继续。
 
-3. 正常重启，按首次安装第 5 步核对版本并实际试用。不需要新建工作区、删除聊天或清空历史。
-4. 旧单次消息链仍只有一次回信权，升级不会把旧链或旧审批变成持续授权。要多轮协作，在原发起聊天明确提出持续任务，批准新的范围；后续通过该范围推进。
+核对实际创建的是可独立打开的主会话，首次审批目标、成员和预算符合要求；两次真实结果均为 43，后续没有人工消息解锁；任务和范围都有完成状态。拒绝首次审批时不应创建或派工，取消不代表撤销外部副作用。
 
-## 常见问题
+会话头部应提供“导出协作日志”；下载后确认版本、发送链及拒绝／失败阶段可关联，默认无正文和原始错误。该导出只保存到本机，不自动上传。命令兼容入口不替代图形入口验收。
 
-| 现象 | 检查与处理 |
-|---|---|
-| `Unsupported engine` 或构建失败 | 核对 Node 与 pnpm 版本；本版 tsdown 的要求高于插件运行清单中的 Node 最低声明。保留首个错误，修复环境后重新构建。 |
-| 安装后仍显示旧版本 | 核对安装的是 `desktop` profile 及最新 tgz，正常退出并重新打开应用；只刷新前端不能证明宿主代码已更新。 |
-| 模型说“第三次自动消息被拦” | 查看实际失败工具。旧 `session_coordinator_send` 的单次两跳保护仍生效；持续任务应使用已批准的协作范围。助手的一句归因不能证明宿主全局限制。 |
-| 范围批准后再次索取同一授权 | 保留工具名、实际错误及版本反馈；明确拒绝后应等待新的人工请求，不能换入口重试。 |
-| 来源名称暂不可用 | 当前原生会话列表缺少标题时会显示该占位；仍保留“查看来源会话”的准确身份，不把长 ID 当名称。 |
-| 任务失败、预算用尽或结果待确认 | 查看具体状态与原因；结果待确认时先对账原操作，不能换 ID 盲目重发。 |
+本次隔离安装结果见[本版验收](ACCEPTANCE.md)。隔离 web profile 的结果不自动代表当前业务 Electron desktop profile、全部图形交互或其他平台均已验证。
 
 ## 卸载与反馈
 
-在插件管理中卸载本插件，或执行 `dsh plugin --profile desktop remove dsh-session-coordinator`，然后正常重启。无需删除工作区和聊天。
+```bash
+dsh plugin --profile desktop remove dsh-session-coordinator
+```
 
-反馈到 [GitHub Issues](https://github.com/cxydaizihao520/dsh-session-coordinator/issues)，附插件/宿主版本、预期行为、实际工具错误及可复现的脱敏步骤。保留自己的原始日志，仅分享必要片段，避免提交密钥、业务数据和完整私人会话。
-
-本版是源码试用，完整用户旅程仍在补测；公开分支的检查范围见 [README](../README.md)。
+正常重启后核对移除状态，无需删除工作区和聊天。反馈到 [GitHub Issues](https://github.com/cxydaizihao520/dsh-session-coordinator/issues)，附版本、预期行为、实际错误和必要的脱敏复现信息。不要上传密钥、完整私人日志或业务数据。
