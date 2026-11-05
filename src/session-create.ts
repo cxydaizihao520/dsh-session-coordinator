@@ -1,3 +1,5 @@
+import { throwIfCollaborationAborted } from './core.ts'
+import { readSessionModelSelection, recordSessionModelSelection } from './session-model-selection.ts'
 /**
  * 会话创建：`session_coordinator_create` 工具与守护循环的「循环转移」共用同一条路径。
  *
@@ -10,7 +12,7 @@
  * 单独成文件是为了让纯逻辑测试（core/loop-guard/handoff）不必加载宿主包。
  */
 import { randomUUID } from 'node:crypto'
-import type { Context } from '@deepseek-ai/cordis'
+import { getTraceable, type Context } from 'cordis'
 import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
 import * as agentApi from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
@@ -72,13 +74,13 @@ export interface CreatedBridgeSession {
 
 /** Reuse the host's exact-model validation without dispatching a request or adopting defaults. */
 export async function validateBridgeSessionModel(ctx: Context, selection: { provider?: string; model?: string; reasoningEffort?: string }, signal?: AbortSignal): Promise<void> {
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
   if (!selection.provider && !selection.model && selection.reasoningEffort === undefined) return
   if (!selection.provider || !selection.model) throw new Error('cannot validate model selection without an exact provider and model')
   const llm = ctx.get?.('llm') as { resolveCallConfig(config: { provider: string; model: string; reasoningEffort?: string }, signal?: AbortSignal): Promise<unknown> } | undefined
   if (typeof llm?.resolveCallConfig !== 'function') throw new Error('native model capability validation is unavailable; cannot accept this model selection')
   await llm.resolveCallConfig({ provider: selection.provider, model: selection.model, ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }) }, signal)
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
 }
 
 /**
@@ -100,30 +102,39 @@ export async function createBridgeSession(
     : callerHeader?.config?.reasoningEffort
   await validateBridgeSessionModel(ctx, { provider, model, reasoningEffort }, options.signal)
 
-  const selection: ModelSelectionRef = {
-    current: {
+  let createdAgent: LiveAgentLike | undefined
+  const initialSelection = {
       ...(provider !== '' ? { provider } : {}),
       ...(model !== '' ? { model } : {}),
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+  }
+  const selection: ModelSelectionRef = {
+    get current() {
+      if (!createdAgent) return initialSelection
+      const current = readSessionModelSelection(createdAgent)
+      if (!current) throw new Error('native model selection is unavailable')
+      return current
     },
   }
   const installModelSelection = (agentApi as unknown as { installModelSelection?: (agentCtx: Context, selection: ModelSelectionRef) => () => void }).installModelSelection
 
   const sessionId = options.sessionId ?? `${options.idPrefix ?? 'sb-'}${randomUUID()}`
-  const agents = ctx.agents as unknown as {
+  const agents = getTraceable(ctx.root ?? ctx, ctx.agents) as unknown as {
     create(options: {
       sessionId: string
+      signal?: AbortSignal
       meta?: { cwd?: string; agentPreset?: string }
       agentOptions?: Record<string, unknown>
-      setup?: (agentCtx: Context) => void | Promise<void>
+      setup?: (agentCtx: Context, agent: LiveAgentLike) => void | Promise<void>
     }): Promise<{ agent: LiveAgentLike }>
   }
   const requestedPreset = typeof options.agentPreset === 'string' && options.agentPreset.trim() !== '' ? options.agentPreset.trim() : undefined
   const presets = ctx.agentPresets as unknown as { composedPreset(agentCtx: Context): string | undefined; composeFrom(agentCtx: Context, parentCtx: Context): string | undefined; mount(agentCtx: Context, id: string): Promise<unknown> }
   const persistedPreset = requestedPreset ?? (caller ? presets.composedPreset(caller.ctx) : undefined)
-  options.signal?.throwIfAborted()
+  throwIfCollaborationAborted(options.signal)
   const handle = await agents.create({
     sessionId,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
     meta: {
       cwd: targetCwd,
       ...(persistedPreset === undefined ? {} : { agentPreset: persistedPreset }),
@@ -133,7 +144,8 @@ export async function createBridgeSession(
       ...(model !== '' ? { model } : {}),
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     },
-    setup: async (agentCtx: Context) => {
+    setup: async (agentCtx: Context, agent?: LiveAgentLike) => {
+      if (agent) { createdAgent = agent; recordSessionModelSelection(agent, initialSelection) }
       if (requestedPreset !== undefined) {
         // 显式 agentPreset 就组合那一个预设。落到下面的 caller-join 会静默忽略请求：
         // id 仍然写进 session header，而 agent 实际跑在调用方的既有组合与工具上。
@@ -164,6 +176,7 @@ export async function createBridgeSession(
   })
 
   const agent = handle.agent
+  createdAgent = agent
   // 镜像 session-controller.create 的记账：把新会话计入其 cwd 所属的
   // workspace，否则会话出现在 UI "未分组"（workspace sessionIds 只经
   // attach/bootstrap 两条路径记账）。
@@ -251,7 +264,12 @@ async function resumeComposedSession(ctx: Context, args: ResumeArgs): Promise<Li
         if (!state && sessionEvents(agent.session).some(event => (event.type as string) === 'model/selection')) throw new Error('cold model selection requires its native modelSelection state')
         const selected = select(state?.pending ?? fromHeader(agent.session.requestHeader()))
         await validateBridgeSessionModel(ctx, selected)
-        install(agentCtx, { current: selected })
+        if ((args.provider !== undefined || args.model !== undefined || args.reasoningEffort !== undefined) && !recordSessionModelSelection(agent, selected)) throw new Error('explicit cold model override requires native modelSelection projection')
+        install(agentCtx, { get current() {
+          const current = readSessionModelSelection(agent)
+          if (!current) throw new Error('native model selection is unavailable')
+          return current
+        } })
         if (preset) await presets!.mount(agentCtx, preset.id)
       },
     })

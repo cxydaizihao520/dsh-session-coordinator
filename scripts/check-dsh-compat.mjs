@@ -97,10 +97,13 @@ function resolveScopeDir(argv) {
 }
 
 /** Resolve a package's types entry point inside the scope directory. */
-function typesEntry(scope, pkg) {
+function packageDir(scope, pkg) {
   const scoped = join(scope, pkg)
   const alias = join(dirname(scope), pkg)
-  const dir = !existsSync(scoped) && readJson(join(alias, 'package.json'))?.name === '@deepseek-ai/' + pkg ? alias : scoped
+  return !existsSync(scoped) && readJson(join(alias, 'package.json'))?.name === '@deepseek-ai/' + pkg ? alias : scoped
+}
+
+function typesEntry(dir) {
   const manifest = readJson(join(dir, 'package.json'))
   if (manifest === undefined) return undefined
   const declared = typeof manifest.types === 'string' ? manifest.types : undefined
@@ -266,9 +269,17 @@ wanted.add('@deepseek-ai/schemastery')
 const paths = {}
 const missing = []
 for (const name of [...wanted].sort()) {
-  const entry = typesEntry(scope, name.slice('@deepseek-ai/'.length))
+  const dir = packageDir(scope, name.slice('@deepseek-ai/'.length))
+  const entry = typesEntry(dir)
   if (entry === undefined) { missing.push(name); continue }
   paths[name] = [entry]
+  // TypeScript paths for bare packages do not cover exported subpaths.
+  const exports = readJson(join(dir, 'package.json'))?.exports
+  for (const [subpath, conditions] of Object.entries(exports ?? {})) {
+    if (!subpath.startsWith('./') || subpath.includes('*') || typeof conditions?.types !== 'string') continue
+    const target = join(dir, conditions.types)
+    if (existsSync(target)) paths[name + subpath.slice(1)] = [target]
+  }
 }
 // tsconfig.json maps the bare `cordis` specifier; keep that working under the
 // installed layout too, where cordis is published scoped.

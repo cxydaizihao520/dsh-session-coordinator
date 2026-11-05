@@ -20,6 +20,7 @@ import { registerBridgeTools } from '../src/tools.ts'
 function captureTools() {
   const tools = new Map()
   const ctx = {
+    on(){return()=>{}},
     tools: { register: (tool) => { tools.set(tool.name, tool) } },
     workspaceRegistry: {
       // 'no-title'    → log exists but carries no title event / user message
@@ -78,13 +79,23 @@ async function test(name, fn) {
 
 const tools = captureTools()
 
+await test('archive contracts require session identity and expose no task selector', () => {
+  for (const name of ['archive','unarchive']) {
+    const schema=tools.get('session_coordinator_'+name).parameters
+    assert.ok(schema.required.includes('sessionId'))
+    assert.equal(schema.properties.taskHandle, undefined)
+  }
+})
+
 await test('registerBridgeTools registers the archived tool', () => {
   assert.ok(tools.has('session_coordinator_archived'))
   assert.ok(tools.has('session_coordinator_archive'))
   assert.ok(tools.has('session_coordinator_unarchive'))
   // 工具总数是全局契约：#5 加了第 16 个（只读回执查询）。改这里必须同时改
   // dsh.plugin.json 的 contributes.tools 与 scripts/smoke-bundle.mjs 的 expected。
-  assert.equal(tools.size, 24)
+  assert.ok(tools.has('session_coordinator_control'))
+  assert.ok(tools.has('session_coordinator_task'))
+  assert.equal(tools.size, 26)
 })
 
 /**
@@ -97,6 +108,7 @@ function archiveHarness(initial = []) {
   const calls = []
   const registered = new Map()
   const ctx = {
+    on(){return()=>{}},
     tools: { register: (tool) => { registered.set(tool.name, tool) } },
     workspaceRegistry: {
       get archivedSessionIds() { return archive },
@@ -190,6 +202,7 @@ await test('resolveTitles: unresolved titles stay absent — the value is lossle
 await test('resolveTitles: bridge-registered aliases win over log titles', async () => {
   const tools2 = new Map()
   const ctx = {
+    on(){return()=>{}},
     tools: { register: (tool) => { tools2.set(tool.name, tool) } },
     workspaceRegistry: { archivedSessionIds: ['sb-1'], list: () => [], get: () => undefined, resolveByPath: async () => undefined },
     sessionPersistence: {
@@ -269,6 +282,7 @@ await test('resolveTitles: only the returned ids are read from persistence', asy
   let opens = 0
   const registered = new Map()
   const ctx = {
+    on(){return()=>{}},
     tools: { register: (tool) => { registered.set(tool.name, tool) } },
     workspaceRegistry: {
       archivedSessionIds: ['a', 'b', 'c', 'd'],

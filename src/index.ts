@@ -1,3 +1,5 @@
+import type { SessionDelivery } from './delivery.ts'
+import type { LiveAgentLike } from './core.ts'
 /**
  * dsh-session-coordinator host half: 注册会话协调工具
  * (create / send / resume / wait / read / find / status / cancel / monitor_* )，
@@ -12,8 +14,9 @@ import { SessionMonitor } from './monitor.ts'
 import { registerBridgeTools, type BridgeEnv } from './tools.ts'
 import { Config, createLoopPolicy } from './config.ts'
 import { createConfigWriter, registerLoopCommands } from './commands.ts'
-import { HOP_RULE_TEXT, COLLABORATION_RULE_TEXT } from './hop.ts'
+import { COLLABORATION_RULE_TEXT } from './hop.ts'
 import { createGrants, registerCoordinateCommand } from './coordinate.ts'
+import { sessionControlCommand } from './session-control.ts'
 
 /** 插件配置：思维链循环自动中断的开关与全局默认值（设置页表单与 /cot-loop 共用同一份）。 */
 export { Config }
@@ -27,15 +30,16 @@ export const inject = ['sessions', 'agents', 'sessionPersistence', 'workspaceReg
 /** `systemPrompt` 服务的结构面：它不是本插件的必需依赖，旧 harness 上不存在。 */
 interface SystemPromptLike {
   section(section: { name: string; order: number; text: string }): () => void
+  context?(entry: { name: string; order: number; required: boolean; interpolate: boolean; text(context: { agent?: LiveAgentLike }): string }): () => void
 }
 
 /**
- * 先说明会话对象与持续协作，再给仅限旧单次模式的两跳规则；文案与工具描述同源。
+ * 说明当前会话工具与持续协作；旧单次规则只由实际兼容上下文提供。
  * order 取字面量 2350：紧跟在 DSH 的 session 查询工具段（2300）之后、goal 段（2400）
  * 之前；不调 `getSectionOrder('TOOL_SESSION_QUERY')` 是因为更老的 systemPrompt 版本
  * 未必有这个槽位，拿到 undefined 会让注册抛错——静态序这里只影响位置，不影响渲染。
  */
-const HOP_SECTION = { name: 'dsh-session-coordinator:hop-rule', order: 2350, text: COLLABORATION_RULE_TEXT + '\n\n' + HOP_RULE_TEXT }
+const HOP_SECTION = { name: 'dsh-session-coordinator:hop-rule', order: 2350, text: COLLABORATION_RULE_TEXT }
 
 /** Host plugin body. */
 export function apply(ctx: Context, config?: unknown): void {
@@ -59,14 +63,21 @@ export function apply(ctx: Context, config?: unknown): void {
     (callerId) => {
       env.delivery!.revoke(callerId)
       for (const entry of monitor.list()) if (entry.config.coordinatorId === callerId) monitor.stop(entry.config.sessionId)
-    })
+    },payload=>sessionControlCommand(env,payload))
   // 斜杠命令 /cot-loop：与设置页共用同一份配置；commands 服务缺失时静默跳过。
   registerLoopCommands(ctx, { policy, writeConfig: createConfigWriter(ctx) })
   // 防环规则写进系统提示段（#6）。systemPrompt 是可选服务：旧 harness 上不存在，
   // 用动态 inject 而不是静态 inject 清单，缺失时只是这段不生效，插件照常激活。
-  ctx.inject(['systemPrompt'], (scope) => {
-    const prompt = scope as unknown as { systemPrompt: SystemPromptLike }
-    prompt.systemPrompt.section(HOP_SECTION)
-  })
+  registerSessionPrompt(ctx, env.delivery!)
   ctx.effect(() => () => monitor.dispose())
+}
+
+/** Public host prompt contribution: source authority is separate from business text. */
+export function registerSessionPrompt(ctx: Context, delivery: SessionDelivery): void {
+  ctx.inject(['systemPrompt'], scope => {
+    const prompt = (scope as unknown as { systemPrompt: SystemPromptLike }).systemPrompt
+    prompt.section(HOP_SECTION)
+    prompt.context?.({ name: 'dsh-session-coordinator:communication', order: 2350, required: true, interpolate: false,
+      text: context => context.agent ? delivery.modelContext(context.agent) : '' })
+  })
 }

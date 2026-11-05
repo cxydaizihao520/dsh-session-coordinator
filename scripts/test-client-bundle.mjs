@@ -21,6 +21,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import vm from 'node:vm'
+import {webcrypto,createHash} from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { sourceIdentityMessage } from '../src/core.ts'
 
@@ -87,7 +88,7 @@ function fakeReact() {
 }
 
 /** 在 vm 里求值产物，返回它交给 __ModuleLoader__ 的条目。 */
-function loadEntry() {
+function loadEntry(overrides = {}) {
   assert.ok(clientSource !== undefined, '客户端产物文件不存在：package.json exports["./client"] 指向 ' + String(clientRel))
   const captured = []
   let seq = 0
@@ -95,6 +96,7 @@ function loadEntry() {
     window: { __ModuleLoader__: { load: (entry) => captured.push(entry) } },
     console: { log() {}, error() {}, warn() {} },
     crypto: { randomUUID: () => `uuid-${++seq}` },
+    ...overrides,
   }
   vm.runInNewContext(clientSource, sandbox, { filename: clientFile })
   assert.equal(captured.length, 1, '产物必须且只能注册一个模块，实际 ' + captured.length)
@@ -200,8 +202,8 @@ function conversationRegistry(onRegister = () => {}) {
   }
 }
 
-function registrationOf(registrations, name) {
-  const found = registrations.filter((r) => r.options?.name === name)
+function registrationOf(registrations, name, id = name === 'conversation.session.header.utilities' ? 'collaboration-diagnostics' : undefined) {
+  const found = registrations.filter((r) => r.options?.name === name && (id === undefined || r.options.id === id))
   assert.equal(found.length, 1, `插槽 ${name} 必须注册且只注册一次，实际 ${found.length} 次`)
   return found[0]
 }
@@ -290,13 +292,15 @@ await test('清单: 产物只 require("react")', () => {
 
 // --- 2. 注册 ----------------------------------------------------------------
 
-await test('注册: 只保留会话头部日志入口，不再注册人工发送表单', () => {
+await test('注册: 会话头部仅日志图标，不注册控制工作台或人工发送表单', () => {
   const { mod } = factoryOf(loadEntry())
   const { ctx, registrations } = createCtx()
   mod.apply(ctx)
   assert.equal(registrations.some(r => ['conversation.input.left', 'conversation.input.overlay'].includes(r.options.name)), false)
   const header = registrationOf(registrations, 'conversation.session.header.utilities')
   assert.equal(header.options.locale, 'dsh-session-coordinator')
+  assert.equal(registrations.some(r=>r.options.id==='collaboration-controls'),false)
+  assert.equal(registrations.filter(r=>r.options.name==='conversation.session.header.utilities').length,1)
 })
 
 await test('注册: 中英词典都注册（界面文字不走硬编码中文）', () => {
@@ -531,6 +535,7 @@ await test('旧客户端: 可选服务缺席仍注册诊断入口', () => {
   ctx.inject = () => {}
   mod.apply(ctx)
   assert.equal(registrations.length, 1)
+  registrationOf(registrations,'conversation.session.header.utilities')
 })
 
 await test('卡片: 打开和补读失败可见，不触发投递或后台跟随', async () => {
@@ -1041,6 +1046,8 @@ await test('接收呈现: 宿主真实生成的任务和终态回信均保持身
   const body = '用户原文：session_coordinator_send\nreplyTo=真实字段也不能删。\n请讨论“本次往返已结束，无需回信”这句原话。'
   for (const identity of [
     { senderSessionId: 'A', senderLabel: '设计', messageId: 'root', rootMessageId: 'root', hopCount: 1 },
+    { protocolVersion: 2, senderSessionId: 'A', senderLabel: '设计', messageId: 'root-v2', rootMessageId: 'root-v2', hopCount: 1 },
+    { protocolVersion: 2, senderSessionId: 'B', senderLabel: '测试', messageId: 'reply-v2', replyTo: 'root-v2', rootMessageId: 'root-v2', hopCount: 2 },
     { senderSessionId: 'B', messageId: 'reply', replyTo: 'root', rootMessageId: 'root', hopCount: 2 },
     { senderSessionId: 'B', senderLabel: '实现', messageId: 'reply', replyTo: 'root', rootMessageId: 'root', hopCount: 2 },
   ]) {
@@ -1389,6 +1396,9 @@ await test('诊断: 一键只读导出，识别旧版本和失败，双击不会
   let downloaded
   const props = { ...mounted.props, downloadDiagnostics: data => { downloaded = data } }
   const button = findNode(mounted.reg.Comp(props), n => n.type === 'button')
+  assert.equal(button.props['aria-label'], '导出协作日志')
+  assert.equal(textOf(button), '')
+  assert.ok(findNode(button, node => node.type === 'svg'))
   const pending = button.props.onClick()
   await button.props.onClick()
   assert.equal(calls, 1)
@@ -1399,6 +1409,34 @@ await test('诊断: 一键只读导出，识别旧版本和失败，双击不会
   await assert.rejects(props.exportDiagnostics('session-self'))
   ctx.remote.commands.execute = async () => ({ok:false,error:{message:'PRIVATE'}})
   await assert.rejects(props.exportDiagnostics('session-self'))
+})
+
+await test('诊断: 下载反馈不撑开顶栏，失败在图标和无障碍提示中保留', async () => {
+  const {mod,react}=factoryOf(loadEntry()),{ctx,registrations}=createCtx(),cells=[];let cursor=0,fail=false
+  react.useState=initial=>{const at=cursor++;if(!(at in cells))cells[at]=initial;return[cells[at],value=>{cells[at]=typeof value==='function'?value(cells[at]):value}]}
+  mod.apply(ctx)
+  const reg=registrationOf(registrations,'conversation.session.header.utilities')
+  const props={sessionId:'session-self',t:key=>key,async exportDiagnostics(){if(fail)throw Error('private');return{sessions:[{total:1,incomplete:false}],discovery:{truncated:false}}},downloadDiagnostics(){}}
+  const render=()=>{cursor=0;return reg.Comp(props)}
+  await findNode(render(),node=>node.type==='button').props.onClick()
+  let tree=render(),button=findNode(tree,node=>node.type==='button'),status=findNode(tree,node=>node.props.role==='status')
+  assert.equal(textOf(button),'');assert.equal(button.props.title,'已开始下载')
+  assert.equal(status.props.style.position,'absolute');assert.equal(status.props.style.width,1)
+  fail=true;await button.props.onClick();tree=render();button=findNode(tree,node=>node.type==='button')
+  assert.ok(button.props.style.color);assert.match(button.props.title,/导出失败/)
+  assert.ok(findNode(tree,node=>node.props.role==='alert'));assert.ok(!textOf(tree).includes('private'))
+})
+
+await test('诊断: 运行中的客户端factory指纹与可用宿主版本，缺失能力明确unknown', async () => {
+ for (const available of [true,false]) {
+  const entry=loadEntry(available?{crypto:webcrypto,TextEncoder}:{}),{mod}=factoryOf(entry),{ctx,registrations}=createCtx();
+  ctx.get=name=>available&&name==='productAnalytics'?{config:{appVersion:'0.2.1-rc.5'}}:undefined;
+  ctx.remote.commands.execute=async()=>({ok:true,value:{result:{kind:'success',text:JSON.stringify({schemaVersion:1,businessContentIncluded:false,sessions:[],discovery:{truncated:false}})}}});
+  mod.apply(ctx);const mounted=mount(registrations,'conversation.session.header.utilities'),data=await mounted.props.exportDiagnostics('session-self');
+  assert.equal(data.runtime.client.loadedVersion,pkg.version);assert.equal(data.runtime.host.version,available?'0.2.1-rc.5':null);
+  assert.equal(data.runtime.client.loadedFingerprint?.value??null,available?createHash('sha256').update(entry.factory.toString()).digest('hex'):null);
+  assert.equal(data.runtime.unknownFields.includes('client.loadedFingerprint'),!available);assert.ok(data.runtime.unknownFields.includes('host.fingerprint'));
+ }
 })
 
 await test('不侵入: 产物里没有 mention 序列化，也不读写输入框状态', () => {

@@ -154,7 +154,7 @@ await test('create: selected routes require validation support, while host defau
 await test('create: cancellation during native capability lookup creates nothing', async () => {
   const controller = new AbortController()
   const h = harness({ onModelLookup() { controller.abort() } })
-  await assert.rejects(h.run({ cwd: 'D:/target', provider: 'fixture', model: 'plain', signal: controller.signal }, false), error => error.name === 'AbortError')
+  await assert.rejects(h.run({ cwd: 'D:/target', provider: 'fixture', model: 'plain', signal: controller.signal }, false), error => error.message === 'collaboration cancelled' && error.cause === controller.signal.reason)
   assert.equal(h.createCalls.length, 0); assert.equal(h.followups.length, 0)
 })
 

@@ -14,7 +14,7 @@
  * needed: the bundle is plain ESM JavaScript.
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
@@ -32,7 +32,8 @@ const promptSections = []
 /** ctx（第一个桩宿主）上注册的斜杠命令：/coordinate 在这里开闸门。 */
 const commands1 = []
 const ctx = {
-  tools: { register: (tool) => { tools.set(tool.name, tool) } },
+  tools: { register: (tool) => { tools.set(tool.name, tool); return () => tools.delete(tool.name) } },
+  on: () => () => {},
   // Optional services are mounted through the cordis `ctx.inject(names, cb)` API
   // (the real host always has it; only this stub can lack it). `systemPrompt` is
   // optional: the plugin registers its loop-guard section when, and only when,
@@ -83,12 +84,12 @@ assert.equal(tools.size, expected.length, 'every declared tool must register, an
 // --- loop guard system prompt section (issue #6) ------------------------------
 // The rule text is shared by the tool description and this optional-systemPrompt
 // section; the artifact-level contract is that mounting really registers it, and
-// that the mounted text carries the default limit and the terminal marker.
+// that the mounted text describes the current core interface. Model routing remains a desktop acceptance item.
 assert.equal(promptSections.length, 1, 'apply() must mount exactly one system prompt section')
 assert.equal(promptSections[0].name, 'dsh-session-coordinator:hop-rule')
 assert.ok(promptSections[0].text.startsWith('会话对象与持续协作'), 'the registered artifact must explain session selection before the scoped legacy hop rule; this does not prove model routing')
-assert.match(promptSections[0].text, /hop 2/)
-assert.match(promptSections[0].text, /TERMINAL/)
+assert.doesNotMatch(promptSections[0].text, /collaboration_start|hop 2/)
+assert.match(promptSections[0].text, /send\(targets, content\)/)
 
 const archiveExec = { agent: { id: 'archive-caller' } }
 await commands1.find(c => c.name === 'coordinate').handler({ agent: archiveExec.agent, rawInput: 'on busy busy2' })
@@ -238,14 +239,12 @@ const monitorParams = JSON.stringify(monitorTool.parameters ?? {})
   const sendProps = send.parameters?.properties ?? {}
   const createProps = create.parameters?.properties ?? {}
   assert.ok(sendProps.replyTo !== undefined, 'session_coordinator_send must declare replyTo')
-  assert.ok(sendProps.mode !== undefined, 'session_coordinator_send must declare mode')
+  assert.equal(sendProps.mode, undefined, 'legacy mode must not be projected')
+  assert.deepEqual(sendProps.delivery.enum, ['message','queue','context','steer'])
   assert.equal(createProps.replyTo, undefined, 'session_coordinator_create must not declare replyTo')
-  // issue #6 契约：规则文本必须真的在产物里的工具描述上（模型读的是 description，
-  // 不是源码），并且与系统提示段同源 —— 后者由上面的 promptSections 断言锁定。
-  const sendDescription = String(send.description ?? '')
-  for (const marker of ['Loop guard', 'hop 2', 'TERMINAL', 'replyTo']) {
-    assert.ok(sendDescription.includes(marker), 'session_coordinator_send description must carry the loop rule: ' + marker)
-  }
+  // Current send uses one explicit schema; legacy hop behavior remains covered by its behavioral tests.
+  for (const key of ['targets', 'content', 'authorizationRequest', 'requestId']) assert.ok(sendProps[key], 'current send schema: ' + key)
+  assert.ok(!send.parameters.required?.includes('message'), 'legacy message must not block current content')
 }
 
 for (const name of [
@@ -325,10 +324,18 @@ assert.deepEqual([...clientMod.inject].sort(), ['locale', 'remote', 'remote.comm
 // 正文首行是宿主侧职责：两个产物必须写出同一行（逐字比对在 test-client-bundle.mjs）。
 assert.ok(clientSource.includes('remote.commands.execute'))
 assert.equal(clientMod.formatSourceLine, undefined)
-assert.ok(bundleWithSwitch.includes('回信请发给它'), 'the host bundle must inline the same header text')
-for (const slot of ['conversation.input.left', 'conversation.input.overlay']) {
-  assert.ok(clientSource.includes(slot), 'the client artifact must register into ' + slot)
+assert.ok(readdirSync(join(ROOT, 'lib')).filter(name => name.endsWith('.js')).some(name => readFileSync(join(ROOT, 'lib', name), 'utf8').includes('回信请发给它')), 'the host bundle chunks must include the same header text')
+const clientSlots=[]
+const clientContext={
+  locale:{register:()=>()=>{}},effect:setup=>setup(),remote:{commands:{}},
+  sessions:{binding:()=>undefined},uiWorkspace:{openSession(){}},
+  slots:{inject:(_name,setup)=>setup(),register:options=>{clientSlots.push(options);return()=>{}}},
+  inject(names,setup){if(!names.includes('uiConversation'))setup(this)},
 }
+clientMod.apply(clientContext)
+assert.deepEqual(clientSlots.filter(entry=>entry.name==='conversation.session.header.utilities').map(entry=>entry.id).sort(),['collaboration-diagnostics'])
+assert.ok(clientSlots.some(entry=>entry.name==='conversation.chat.commandview'&&entry.key==='coordinate'))
+assert.equal(clientSlots.some(entry=>['conversation.input.left','conversation.input.overlay'].includes(entry.name)),false,'legacy input forms must not be registered')
 assert.ok(!clientSource.includes('dsh-session:'), 'the client artifact must never serialize a dsh-session mention')
 
 console.log('smoke-bundle: OK — lib/index.js mounts and registers ' + String(tools.size) + ' tools')
