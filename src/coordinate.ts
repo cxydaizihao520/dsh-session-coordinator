@@ -34,7 +34,7 @@ export function createGrants(): CoordinationGrants {
 export function denialMessage(sessionId: string, action: GatedAction, targetId?: string): string {
   return 'session ' + JSON.stringify(sessionId) + ' is not authorized to coordinate other sessions: ' + action +
     ' refused for ' + JSON.stringify(targetId ?? '(new session)') +
-    '. This is the legacy single-exchange entry. For a human-requested ongoing collaboration, the originating chat must use collaboration_start and its native scope approval, not /coordinate on. For an explicitly single exchange, ask the human to run /coordinate on <target-session-id ...>. Only the specified targets are allowed; ' +
+    '. This operation requires legacy target authorization. Current conversation messages use session_coordinator_send with an explicit authorizationRequest (extent=message or work). For this legacy or management operation, ask the human to run /coordinate on <target-session-id ...>. Only the specified targets are allowed; ' +
     'a verified incoming task permits one reply to its sender without another grant. Read-only tools are never gated. ' +
     (action === 'create' ? 'Create sessions in the UI first, then authorize their ids.' : '')
 }
@@ -70,15 +70,16 @@ export function runCoordinateCommand(grants: CoordinationGrants, sessionId: stri
   const targets = grants.list(sessionId)
   return { kind: 'success', text: targets.length === 0
     ? '本会话未授权任何目标。只读查询仍可用；/coordinate on <目标会话id ...> 指定目标。'
-    : '单次模式：已授权本会话仅协调：' + targets.join(', ') + '。每次单次任务的接收方可向发送者回信一次，无需单独授权；这不是持续协作的轮数限制。多轮协作请在原发起会话提出持续任务，由 collaboration_start 审批范围后自动推进。本单次授权重启失效；/coordinate off 收回。' }
+    : '单次模式：已授权本会话仅协调：' + targets.join(', ') + '。每次单次任务的接收方可向发送者回信一次，无需单独授权；这不是持续协作的轮数限制。多轮协作请用 session_coordinator_send 的 authorizationRequest.extent=work 明确成员和用途，经原生审批后在该范围内交流。本单次授权重启失效；/coordinate off 收回。' }
 }
 
+export interface CoordinateInvocation {rawInput?:string;agent?:{id?:string};commandId?:string;signal?:AbortSignal}
 interface CommandsLike {
   register(command: {
     name: string
     description: string
     input?: { hint?: string }
-    handler: (payload: { rawInput?: string; agent?: { id?: string } }) => CommandResult | Promise<CommandResult>
+    handler: (payload: CoordinateInvocation) => CommandResult | Promise<CommandResult>
   }): unknown
 }
 
@@ -92,6 +93,7 @@ export function registerCoordinateCommand(
   ctx: Context, grants: CoordinationGrants,
   send?: (callerId: string, rawInput: string) => Promise<CommandResult>,
   revoke?: (callerId: string) => void,
+  control?: (payload:CoordinateInvocation)=>Promise<CommandResult>,
 ): void {
   const candidate = ctx as unknown as { inject?: (names: string[], cb: (child: unknown) => void) => unknown }
   if (typeof candidate.inject !== 'function') return
@@ -106,6 +108,7 @@ export function registerCoordinateCommand(
         handler: (payload) => {
           const callerId = payload.agent?.id ?? ''
           const raw = (payload.rawInput ?? '').trim()
+          if(raw==='controls'||raw.startsWith('control '))return control?.(payload)??{kind:'error',text:'协作控制不可用，请重新加载插件。'}
           if (raw === 'logs-related') return exportRelatedDiagnostics(ctx, callerId).then(value => ({ kind: 'success' as const, text: JSON.stringify(value) }), () => ({ kind: 'error' as const, text: '无法导出协作日志，请稍后重试。' }))
           if (raw === 'logs' || raw.startsWith('logs ')) return exportDiagnostics(ctx, callerId, raw.split(/\s+/).slice(1)).then(value => ({ kind: 'success' as const, text: JSON.stringify(value, null, 2) }), () => ({ kind: 'error' as const, text: '无法导出协作日志；请核对当前会话和明确的对方会话ID。' }))
           if (raw.startsWith('send ') && send !== undefined) return send(callerId, raw.slice(5))

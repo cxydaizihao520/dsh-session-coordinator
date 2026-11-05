@@ -1,17 +1,17 @@
 # 收录材料状态
 
-核对日期：2026-10-30。此目录是投稿材料，不含账号检查、私人日志或本机操作记录。流程见 [发布与收录手册](../RELEASING.md)。
+核对日期：2026-11-05。此目录是投稿材料，不含账号检查、私人日志或本机操作记录。流程见 [发布与收录手册](../RELEASING.md)。
 
 | 指南项目 | 当前状态 |
 | --- | --- |
 | 投稿范围 | 仅 data/plugins/cxydaizihao520__dsh-session-coordinator.yml；上游 README 不修改 |
-| 公开源码 | main，版本 0.2.15，提交 db824e27c9ff2315e6dd0216aef665a4cf9f96a6 |
+| 公开源码 | main，版本 0.2.20 预览 |
 | 仓库状态 | 已核对公开、未归档、创建满一天及 dsh-plugin topic |
 | 安装清单 | dsh.bundle.patch、patch 文件、宿主与客户端入口齐全 |
-| 公开源码安装 | 从上述 GitHub 精确提交实际安装、prepare 构建及 24 个工具注册通过 |
-| 功能与版本范围 | 见 [该提交验收说明](https://github.com/cxydaizihao520/dsh-session-coordinator/blob/db824e27c9ff2315e6dd0216aef665a4cf9f96a6/docs/ACCEPTANCE.md)；未覆盖项不标通过 |
+| 公开源码安装 | 0.2.20 干净检出 prepare 构建通过，本地预构建包经官方安装器安装。旧版 GitHub 安装证据仅适用于 0.2.15 |
+| 功能与版本范围 | 见 [本版验收说明](../ACCEPTANCE.md)；未覆盖项不标通过 |
 | 条目 | session 分类；英中单行描述；复用上游校验器通过 |
-| npm | 可选，未发布；不作为当前源码安装或收录的前置条件 |
+| npm | 可选；发行版本以 npm registry 的 beta 标签为准 |
 | tarball | 可选，未发布 Release，不填写未来下载地址 |
 | 图标、截图 | 可选，未附加；避免未经核对的个人资料或会话内容进入附件 |
 | 相关插件 | 已有 session-bridge 条目；差异写入 PR 草稿，是否重复由维护者评审 |

@@ -1,3 +1,4 @@
+import { throwIfCollaborationAborted } from './core.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { DomainFacility, defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
@@ -71,7 +72,7 @@ function immutableRecord(value: unknown): StoredCollaborationRecord {
 /** The caller owns close(). Submitted native writes drain before the kernel lease is released. */
 export async function openCollaborationStore(ctx: Context, options: { directory?: string; signal?: AbortSignal } = {}): Promise<CollaborationStore> {
   if (!ctx.storage?.backend) throw new CollaborationStoreError('unavailable', 'Collaboration requires the native storage service.')
-  options.signal?.throwIfAborted()
+  throwIfCollaborationAborted(options.signal)
   const directory = resolve(options.directory ?? dshHomePath('collaboration'))
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const root = await realpath(directory)
@@ -81,7 +82,7 @@ export async function openCollaborationStore(ctx: Context, options: { directory?
     const held = await lease.stat({ bigint: true })
     const current = await stat(join(root, 'writer.lock'), { bigint: true })
     if (held.ino !== current.ino || held.dev !== current.dev) throw new CollaborationStoreError('already-owned', 'Collaboration writer lock changed; reopen the store.')
-    options.signal?.throwIfAborted()
+    throwIfCollaborationAborted(options.signal)
   } catch (error) {
     await lease.close()
     if (['EAGAIN', 'EWOULDBLOCK'].includes((error as NodeJS.ErrnoException)?.code ?? '')) {
@@ -111,7 +112,7 @@ export async function openCollaborationStore(ctx: Context, options: { directory?
       assertReadable()
       const result = writes.then(() => {
         if (fault) throw fault
-        options.signal?.throwIfAborted()
+        throwIfCollaborationAborted(options.signal)
         return operation()
       })
       writes = result.then(() => {}, () => {})
@@ -174,7 +175,7 @@ export async function openCollaborationStore(ctx: Context, options: { directory?
     options.signal?.addEventListener('abort', onAbort, { once: true })
     if (options.signal?.aborted) {
       await store.close()
-      options.signal.throwIfAborted()
+      throwIfCollaborationAborted(options.signal)
     }
     return store
   } catch (error) {

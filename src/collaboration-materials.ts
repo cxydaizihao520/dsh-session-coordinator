@@ -1,3 +1,4 @@
+import { throwIfCollaborationAborted } from './core.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { basename, isAbsolute } from 'node:path'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -137,7 +138,7 @@ export function renderCollaborationContext(checkpoint: CollaborationContextCheck
 /** Use the native cold-readable fork lifecycle; never copy collaboration authority or start a model. */
 export async function forkCollaborationSession(ctx: MaterialContext, sessionId: string, atSeq?: number, signal?: AbortSignal): Promise<{ sessionId: string; executionAuthority: 'none' }> {
   if (!sessionId || atSeq !== undefined && (!Number.isSafeInteger(atSeq) || atSeq < 0)) throw new Error('Fork requires a source identity and valid event boundary')
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
   const controller = ctx.get('sessionController') as { fork(request: { sessionId: string; atSeq?: number; allowMigration: false }): Promise<{ sessionId: string }> } | undefined
   if (controller === undefined) throw new Error('Native session fork capability is unavailable')
   // Native fork has no cancellation parameter. Once submitted, always return its child identity.
@@ -153,13 +154,13 @@ function attachments(ctx: MaterialContext): MaterialAttachments {
 }
 
 async function accessiblePath(ctx: MaterialContext, path: string, who: string, signal?: AbortSignal): Promise<MaterialFile> {
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
   if (!isAbsolute(path)) throw new Error('Material path must be absolute')
   const fs = ctx.get('fs') as MaterialFilesystem | undefined
   const mapped = fs?.processPathFromHostPath(path)
   if (fs === undefined || mapped === undefined) throw new Error(`${who} cannot access material path`)
   const target = await fs.resolve(mapped, { signal })
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
   return { fs, target, path }
 }
 
@@ -173,7 +174,7 @@ async function* readFileChunks(file: MaterialFile, signal?: AbortSignal): AsyncI
   const before = await fileInfo(file, signal)
   let offset = 0
   do {
-    signal?.throwIfAborted()
+    throwIfCollaborationAborted(signal)
     const length = Math.min(65536, before.size - offset)
     const bytes = await file.fs.readByteRange(file.target, { offset, length }, signal)
     if (bytes.byteLength !== length) throw new Error('Material changed during its read')
@@ -240,17 +241,17 @@ export async function prepareCollaborationMaterials(
         artifacts[index] = { sourcePath, sourceSha256: sha256, sourceBytes: bytes, block: { type: 'file', attachment } }
       }
   }
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
   if (images.length > 0) {
     const refs = await store!.saveImages(images.map(({ data, name, mediaType }) => ({ data, name, mediaType })))
-    signal?.throwIfAborted()
+    throwIfCollaborationAborted(signal)
     if (refs.length !== images.length) throw new Error('Native image admission returned an incomplete batch')
     for (const [position, image] of images.entries()) {
       artifacts[image.index] = { sourcePath: image.sourcePath, sourceSha256: createHash('sha256').update(image.data).digest('hex'), sourceBytes: image.data.byteLength, block: { type: 'image', attachment: refs[position]! } }
     }
   }
   for (const artifact of artifacts) await verifyStored(recipient, artifact.block, signal)
-  signal?.throwIfAborted()
+  throwIfCollaborationAborted(signal)
   return { content: artifacts.map(item => item.block), artifacts }
 }
 
@@ -263,14 +264,14 @@ export async function verifyCollaborationArtifacts(
 ): Promise<ArtifactVerification[]> {
   const results: ArtifactVerification[] = []
   for (const artifact of artifacts) {
-    signal?.throwIfAborted()
+    throwIfCollaborationAborted(signal)
     try {
       await verifyStored(recipient, artifact.block, signal)
       const path = await accessiblePath(source, artifact.sourcePath, 'Source', signal)
       const version = await digestFile(path, signal)
       results.push({ artifact, status: version.sha256 === artifact.sourceSha256 && version.bytes === artifact.sourceBytes ? 'verified' : 'source-changed' })
     } catch (error) {
-      signal?.throwIfAborted()
+      throwIfCollaborationAborted(signal)
       results.push({ artifact, status: 'unavailable', reason: error instanceof Error ? error.message : String(error) })
     }
   }

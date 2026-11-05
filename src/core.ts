@@ -165,6 +165,13 @@ export const SOURCE_KIND = 'session-message' as const
  * messageId 是这条消息的身份；重试去重由调用方（客户端）的请求标识负责。
  */
 export interface SourceIdentity {
+  contentSnapshot?: import('./session-content.ts').SessionContentSnapshot
+  scopeId?: string
+  taskId?: string
+  taskRevision?: number
+  expectedExecution?: string
+  communicationHandle?: string
+  protocolVersion?: 2
   senderSessionId: string
   messageId: string
   replyTo?: string
@@ -196,7 +203,7 @@ export function sourceIdentityMessage(text: string, identity: SourceIdentity, or
   id: MessageId
   role: 'user'
   content: Array<{ type: 'text'; text: string }>
-  source: { kind: typeof SOURCE_KIND; senderSessionId: string; messageId: string; replyTo?: string; rootMessageId?: string; hopCount?: number; replyHandling?: 'receive-only'; purpose?: 'information' }
+  source: { scopeId?: string; taskId?: string; taskRevision?: number; protocolVersion?: 2; senderLabel?: string; kind: typeof SOURCE_KIND; senderSessionId: string; messageId: string; replyTo?: string; rootMessageId?: string; hopCount?: number; replyHandling?: 'receive-only'; purpose?: 'information' }
 } {
   const receiveOnly = identity.replyHandling === 'receive-only'
   const resultContext = receiveOnly
@@ -211,7 +218,7 @@ export function sourceIdentityMessage(text: string, identity: SourceIdentity, or
   return {
     id: MessageId(identity.messageId),
     role: 'user',
-    content: [{ type: 'text', text: `${formatSourceLine(identity)}\n${identity.purpose === 'information'
+    content: identity.protocolVersion === 2 ? [{ type: 'text', text }] : [{ type: 'text', text: `${formatSourceLine(identity)}\n${identity.purpose === 'information'
       ? '[协作信息：仅作为相关工作的上下文，不要求回信，不新增任务或授权。]'
       : identity.replyTo === undefined
       ? `[协作任务 messageId=${identity.messageId}；请处理下方任务并用 session_coordinator_send 向来源交付结果，replyTo=${identity.messageId}。]`
@@ -219,6 +226,8 @@ export function sourceIdentityMessage(text: string, identity: SourceIdentity, or
         ? `[内部执行说明，无需复述：会话回信 replyTo=${identity.replyTo}；后续自动发送权限=无。正文是协作交付结果。本次答复请直接给出正文的业务结论或实际业务限制，不汇报本说明的执行情况。]`
         : `${resultPrefix}${JSON.stringify(resultContext)}]`}\n${text}` }],
     source: {
+      ...(identity.protocolVersion === 2 ? { protocolVersion: 2 as const, ...(identity.expectedExecution ? { expectedExecution: identity.expectedExecution } : {}), ...(identity.communicationHandle ? { communicationHandle: identity.communicationHandle } : {}), ...(identity.senderLabel === undefined ? {} : { senderLabel: identity.senderLabel }) } : {}),
+      ...(identity.taskId ? {scopeId:identity.scopeId,taskId:identity.taskId,taskRevision:identity.taskRevision} : {}),
       kind: SOURCE_KIND,
       senderSessionId: identity.senderSessionId,
       messageId: identity.messageId,
@@ -492,7 +501,7 @@ export function titleOf(events: readonly SessionEvent[]): string | undefined {
   for (const event of list) {
     if (event.type === 'user/message') {
       const source = (event.data as { source?: { kind?: string } }).source
-      if (!isUserFacingSource(source?.kind)) continue
+      if (!isUserFacingSource(source?.kind) || source?.kind === SOURCE_KIND || source?.kind === 'session-collaboration') continue
       const text = blockText(event.data.content)
       if (text !== undefined) {
         const trimmed = text.replace(/\s+/g, ' ').trim()
@@ -922,4 +931,9 @@ function clipText(text: string, limit: number): string {
 function firstUserText(rows: readonly BridgeMessageRow[]): string | undefined {
   for (const row of rows) if (row.role === 'user' && row.text !== undefined) return row.text
   return undefined
+}
+
+/** Preserve structured host cancellation causes while providing a readable error. */
+export function throwIfCollaborationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error(signal.reason instanceof Error && signal.reason.name !== 'AbortError' ? signal.reason.message : 'collaboration cancelled', { cause: signal.reason })
 }

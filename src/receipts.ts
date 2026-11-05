@@ -5,7 +5,7 @@
  * 三级（术语见 GLOSSARY「回执」）：
  *   accepted     已接收：消息躺在目标 inbox 里，还没写进目标历史
  *   appended     已写入：目标历史里出现了这条 user/message
- *   acknowledged 已进入模型请求：写入之后目标发起过模型请求
+ *   acknowledged 写入后见请求：不证明该消息精确进入了请求
  *
  * 状态推导是纯函数 `deriveReceipt`（无副作用、不改事件），工具层只负责读日志、
  * 校验参数与渲染；只读查询不改变任何会话状态。
@@ -69,11 +69,16 @@ function identityMatches(raw: unknown, id: string): boolean {
 }
 
 function causalReceipt(raw: unknown): Partial<Receipt> {
-  const source = (raw as { source?: { kind?: string; rootMessageId?: unknown; hopCount?: unknown; purpose?: unknown } })?.source
+  const source = (raw as { source?: { kind?: string; rootMessageId?: unknown; hopCount?: unknown; purpose?: unknown; protocolVersion?:unknown; communicationHandle?:unknown } })?.source
   if (source?.kind !== 'session-message' || typeof source.rootMessageId !== 'string' ||
     typeof source.hopCount !== 'number' || !Number.isInteger(source.hopCount) || source.hopCount < 1) return {}
   const information = source.purpose === 'information'
-  const terminal = information || source.hopCount >= DEFAULT_MAX_HOPS
+  const work = source.protocolVersion === 2 && typeof source.communicationHandle === 'string' && source.communicationHandle.length > 0
+  // A v2 first message does not persist its none/once reply grant in source.
+  // Historical facts must not manufacture permission from a hop number.
+  if (source.protocolVersion === 2 && !work && !information && source.hopCount < DEFAULT_MAX_HOPS)
+    return { rootMessageId: source.rootMessageId, hopCount: source.hopCount }
+  const terminal = information || !work && source.hopCount >= DEFAULT_MAX_HOPS
   return { rootMessageId: source.rootMessageId, hopCount: source.hopCount, terminal,
     ...(terminal ? { terminalReason: information ? 'information only; no reply requested or permitted' : TERMINAL_REASON } : {}) }
 }
@@ -120,7 +125,7 @@ export function deriveReceipt(events: readonly SessionEvent[], messageId: string
 const STATUS_TEXT: Record<ReceiptStatus, string> = {
   accepted: '已接收，未写入',
   appended: '已写入',
-  acknowledged: '已进入模型请求',
+  acknowledged: '写入后存在模型请求记录（不证明精确纳入）',
   unknown: '未知',
 }
 
@@ -134,6 +139,18 @@ interface ReceiptArgs {
   messageId: string
 }
 
+export async function readMessageReceipt(ctx: Context, args: ReceiptArgs) {
+  if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
+  if (typeof args.messageId !== 'string' || args.messageId.trim() === '') throw new Error('invalid messageId: expected a non-empty string')
+  const messageId = args.messageId.trim(), agent = getLiveAgent(ctx, args.sessionId)
+  let events: readonly SessionEvent[]
+  if (agent === undefined) {
+    try { events = (await inspectPersistedSession(ctx, args.sessionId)).events }
+    catch (error) { throw new Error('cannot read session ' + JSON.stringify(args.sessionId) + ': ' + (error instanceof Error ? error.message : String(error))) }
+  } else events = sessionEvents(agent.session)
+  return { sessionId: args.sessionId, messageId, ...deriveReceipt(events, messageId) }
+}
+
 /**
  * 注册只读回执查询工具。输入是「目标会话 + 一个消息标识」：调用方（投递方）
  * 手上有 session_coordinator_send 返回的 messageId，GUI 面板那侧手上有 requestId，
@@ -142,7 +159,7 @@ interface ReceiptArgs {
 export function registerReceipt(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'session_coordinator_message_status',
-    description: 'Query the delivery receipt of ONE message in a target session, by reading that session event log only — it never sends, resumes, or changes anything. Three levels, each reported only when the log proves it: accepted (the message sits in the target inbox but is not in its history yet), appended (a user/message carrying this identity is in the target history), acknowledged (after that write the target dispatched a model request — step/start, request/header, or a produced assistant message). If the log holds no evidence for this id the status is unknown: it never reports success without evidence. Pass the messageId returned by session_coordinator_send, or for a message delivered from the GUI send panel the request id of that delivery (current panels use that request id as messageId; legacy panels stored source.rpcId).',
+    description: 'Query the delivery receipt of ONE message in a target session, by reading that session event log only — it never sends, resumes, or changes anything. Three levels, each reported only when the log proves it: accepted (a historical inbox insertion exists; this does not prove the message is still pending), appended (a user/message carrying this identity is in the target history), acknowledged (after that write the target dispatched a model request — step/start, request/header, or a produced assistant message). acknowledged is chronological evidence, not exact inclusion in a model request. Causal terminal/hop facts grant no current permission and prove no business completion. If the log holds no evidence for this id the status is unknown: it never reports success without evidence. Pass the messageId returned by session_coordinator_send, or for a message delivered from the GUI send panel the request id of that delivery (current panels use that request id as messageId; legacy panels stored source.rpcId).',
     parameters: {
       sessionId: { type: 'string', required: true, description: 'Target session id the message was delivered to (live or persisted/offline).' },
       messageId: { type: 'string', required: true, description: 'Message identity: the messageId from session_coordinator_send, or the request id of a GUI send (host stores it as source.rpcId).' },
@@ -167,22 +184,7 @@ export function registerReceipt(ctx: Context): void {
       },
     },
     async execute(args: ReceiptArgs) {
-      if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
-      if (typeof args.messageId !== 'string' || args.messageId.trim() === '') throw new Error('invalid messageId: expected a non-empty string')
-      const messageId = args.messageId.trim()
-      const agent = getLiveAgent(ctx, args.sessionId)
-      let events: readonly SessionEvent[]
-      if (agent === undefined) {
-        try {
-          events = (await inspectPersistedSession(ctx, args.sessionId)).events
-        } catch (error) {
-          throw new Error('cannot read session ' + JSON.stringify(args.sessionId) + ': ' + (error instanceof Error ? error.message : String(error)))
-        }
-      } else {
-        events = sessionEvents(agent.session)
-      }
-      const receipt = deriveReceipt(events, messageId)
-      return asJson({ sessionId: args.sessionId, messageId, ...receipt })
+      return asJson(await readMessageReceipt(ctx, args))
     },
   }))
 }

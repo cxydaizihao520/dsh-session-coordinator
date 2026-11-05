@@ -1,3 +1,4 @@
+import {legacyHistory} from './fixtures/legacy-history.mjs'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Session, pluginRecordOf } from '@deepseek-ai/dsh-session'
@@ -21,6 +22,7 @@ function fixture() {
     sessions: { flush: async () => true },
     get: name => name === 'approval' ? { request: async req => { approvals.push(req); return 'allowed-once' } } : undefined }
   const env = { ctx, grants, registry: { touch() {}, get: async () => undefined, all: async () => [] } }
+  legacyHistory(agents.get('A'))
   registerBridgeTools(env)
   const run = args => tools.get('session_coordinator_send').execute(args, { agent: agents.get('A'), callId: 'call', signal: new AbortController().signal })
   return { agents, ctx, env, grants, tools, approvals, run }

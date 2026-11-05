@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import {diagnosticCall} from '../src/diagnostics.ts'
 import { installCollaboration } from '../src/collaboration-tools.ts'
 import { Context } from 'cordis'
 import { LlmRuntime, LlmAdapter, createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -25,7 +26,8 @@ function harness(seed = [], providedStore) {
   const ready = installCollaboration({ ctx, delivery, registry: { record() {} } }, { store })
   let call = 0
   const run = async (name, args, caller = 'A', callId) => { await ready; return tools.get('session_coordinator_collaboration_' + name).execute(args, { agent: agents.get(caller), signal: new AbortController().signal, callId: callId ?? 'call-' + ++call }) }
-  return { async stream(options) { let next = async function* () {}; for (const fn of [...(listeners.get('llm/stream') ?? [])].reverse()) { const inner = next; next = () => fn(options, inner) } for await (const _chunk of next()) {} }, async dispatch(name, ...args) { let result; for (const fn of listeners.get(name) ?? []) result = await fn(...args); return result }, ctx, delivery, clock, store, ready, tools, agents, emit, submissions, approvals, run, records, async admit(operationId, turn = 1) {
+  const legacy=async(args,caller='A',callId)=>{const runtime=await ready,exec={agent:agents.get(caller),signal:new AbortController().signal,callId:callId??'historical-start-'+(++call)};return diagnosticCall(ctx,exec.agent,'session_coordinator_collaboration_start',args,exec.callId,exec.signal,()=>runtime.start(args,exec))}
+  return { legacy,async stream(options) { let next = async function* () {}; for (const fn of [...(listeners.get('llm/stream') ?? [])].reverse()) { const inner = next; next = () => fn(options, inner) } for await (const _chunk of next()) {} }, async dispatch(name, ...args) { let result; for (const fn of listeners.get(name) ?? []) result = await fn(...args); return result }, ctx, delivery, clock, store, ready, tools, agents, emit, submissions, approvals, run, records, async admit(operationId, turn = 1) {
     const submission = submissions.find(s => s.message.id === operationId), agent = agents.get(submission.targetId)
     const message = [...agent.inbox.nextStep, ...agent.inbox.nextTurn].find(item => item.id === operationId) ?? submission.message
     agent.status = 'running'; agent.inbox.remove(operationId)
@@ -39,7 +41,7 @@ function harness(seed = [], providedStore) {
 test('native collaboration wire separates exact business content from model routing context', async () => {
   const h = harness(), get = h.ctx.get
   h.ctx.get = name => name === 'sessionTitle' ? { get: () => ({ title: '订单总控' }) } : get(name)
-  const scope = await h.run('start', { objective: 'Keep scope small', members: ['B'] })
+  const scope = await h.legacy( { objective: 'Keep scope small', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Review orders', members: ['B'] })
   const body = '\n  请复核订单。\n```js\nconst operationId = "literal user text"\n```\n[协作 原文保留]\n  '
   const operation = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: body, intent: 'task' })
@@ -58,7 +60,7 @@ test('renaming a sender before busy-owner admission preserves the exact frozen r
   const h = harness(), get = h.ctx.get
   let title = '核算原名'
   h.ctx.get = name => name === 'sessionTitle' ? { get: () => ({ title }) } : get(name)
-  const scope = await h.run('start', { objective: 'Stable message identity', members: ['B'] })
+  const scope = await h.legacy( { objective: 'Stable message identity', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Check orders', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', intent: 'task', message: 'Check once' })
   await h.admit(op.id)
@@ -76,7 +78,7 @@ test('renaming a sender before busy-owner admission preserves the exact frozen r
 
 test('a worker replies with business evidence alone and ambiguous native work requires an exact selection', async () => {
   const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
-  const h = harness(), scope = await h.run('start', { objective: 'Deliver an order audit', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Deliver an order audit', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Order audit', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Review order evidence', intent: 'task' })
   const args = { text: 'The independently checked total is 43.' }
@@ -102,13 +104,13 @@ test('a worker replies with business evidence alone and ambiguous native work re
   await assert.rejects(h.run('result', { text: 'Ambiguous evidence' }, 'B'), /unambiguous.*native model request/)
   const selected = await h.run('result', { taskId: other.id, text: 'Freight checked' }, 'B')
   assert.equal(selected.operationId, second.id)
-  await assert.rejects(h.run('result', { scopeId: 'invented scope', text: 'No guessing' }, 'B'), /unambiguous.*native model request/)
+  await assert.rejects(h.run('result', { scopeId: 'invented scope', text: 'No guessing' }, 'B'), /unambiguous.*native model request|unknown or not authorized/)
 })
 
 test('business-only late results retain exact whitespace and never restart paused or cancelled work', async () => {
   const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
   for (const action of ['pause', 'cancel']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Preserve late evidence', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Preserve late evidence', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Check once', members: ['B'] })
     const operation = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', intent: 'task', message: 'Check once' })
     await h.admit(operation.id)
@@ -126,7 +128,7 @@ test('business-only late results retain exact whitespace and never restart pause
 
 test('implicit result binds only one exact operation in the current native model request', async () => {
   const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
-  const h = harness(), scope = await h.run('start', { objective: 'Native result correlation', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Native result correlation', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Compute', members: ['B'] })
   const dispatch = () => h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Business text wrongly says operationId=made-up. Native routing must win.', intent: 'task' })
   const op = await dispatch(), args = { scopeId: scope.id, taskId: task.id, taskRevision: 1, text: 'Actual evidence' }
@@ -156,8 +158,8 @@ test('implicit result binds only one exact operation in the current native model
 test('member references never shadow an existing canonical session identity', async () => {
   const h = harness(), original = h.agents.get('B')
   h.agents.set('member:2', { ...original, id: 'member:2', session: { ...original.session, id: 'member:2', header: { id: 'member:2' } } })
-  const scope = await h.run('start', { objective: 'Preserve canonical identities', members: ['C', 'member:2'] })
-  const receipt = JSON.parse(h.tools.get('session_coordinator_collaboration_start').output.render({}, scope)[0].text)
+  const scope = await h.legacy( { objective: 'Preserve canonical identities', members: ['C', 'member:2'] })
+  const receipt = JSON.parse(h.tools.get('session_coordinator_collaboration_status').output.render({}, scope)[0].text)
   const member = receipt.memberDirectory.find(entry => entry.sessionId === 'C')
   const task = await h.run('task', { scopeId: scope.id, objective: 'Only C', members: [member.memberRef] })
   assert.deepEqual(task.members, ['C'])
@@ -168,10 +170,10 @@ test('member references never shadow an existing canonical session identity', as
 
 test('scope member references reach exact approved recipients without reconstructing opaque IDs', async () => {
   const h = harness()
-  const scope = await h.run('start', { objective: 'Review settlement', members: ['B', 'C', 'D'] })
+  const scope = await h.legacy( { objective: 'Review settlement', members: ['B', 'C', 'D'] })
   const render = (name, value) => JSON.parse(h.tools.get('session_coordinator_collaboration_' + name).output.render({}, value)[0].text)
-  const directory = render('start', scope).memberDirectory
-  assert.ok(directory?.length, 'start must expose short member references')
+  const directory = render('status', scope).memberDirectory
+  assert.ok(directory?.length, 'legacy status exposes short member references')
   const b = directory.find(entry => entry.sessionId === 'B')
   const c = directory.find(entry => entry.sessionId === 'C')
   const d = directory.find(entry => entry.sessionId === 'D')
@@ -184,7 +186,7 @@ test('scope member references reach exact approved recipients without reconstruc
   for (const invalid of ['member:0', 'member:02', 'member:99', 'cs-invented']) {
     await assert.rejects(h.run('task', { scopeId: scope.id, objective: 'No fuzzy matching', members: [invalid] }), /approved scope/)
   }
-  const foreign = await h.run('start', { objective: 'Other owner', members: ['D'] }, 'C')
+  const foreign = await h.legacy( { objective: 'Other owner', members: ['D'] }, 'C')
   await assert.rejects(h.run('task', { scopeId: foreign.id, objective: 'No cross-scope authority', members: [b.memberRef] }), /not authorized/)
   const paused = await h.run('control', { scopeId: scope.id, taskId: task.id, action: 'pause', reason: 'Pause only this task' })
   assert.equal(paused.tasks[task.id].state, 'paused')
@@ -195,7 +197,7 @@ test('scope member references reach exact approved recipients without reconstruc
 
 test('one scoped approval supports owner + N, two tasks and more than two rounds with correlated results', async () => {
   const h = harness()
-  const scope = await h.run('start', { objective: 'Deliver two independently verified changes', members: ['B', 'C', 'D'] })
+  const scope = await h.legacy( { objective: 'Deliver two independently verified changes', members: ['B', 'C', 'D'] })
   const one = await h.run('task', { scopeId: scope.id, objective: 'First change', members: ['B', 'C'] })
   const two = await h.run('task', { scopeId: scope.id, objective: 'Second change', members: ['B', 'D'] })
   for (let round = 0; round < 4; round++) {
@@ -215,7 +217,7 @@ test('one scoped approval supports owner + N, two tasks and more than two rounds
 
 test('result notifications use the next-step delivery seam for busy and idle owners while new tasks stay queued', async () => {
   for (const busy of [true, false]) {
-    const h = harness(), scope = await h.run('start', { objective: 'Combine peer evidence with owner work', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Combine peer evidence with owner work', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Compute peer amount', members: ['B'] })
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Compute amount', intent: 'task' })
     assert.equal(h.submissions.at(-1).mode, 'queue')
@@ -253,7 +255,7 @@ test('result notifications use the next-step delivery seam for busy and idle own
 
 test('pending next-step results remain withdrawable by pause, cancel or revision without touching unrelated owner input', async () => {
   for (const action of ['pause', 'cancel', 'revise']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Respect changed work', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Respect changed work', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Compute', members: ['B'] })
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Compute', intent: 'task' })
     await h.admit(op.id)
@@ -270,7 +272,7 @@ test('pending next-step results remain withdrawable by pause, cancel or revision
 })
 
 test('an uncertain next-step result delivery is retained and never reissued by a duplicate result', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Single result notification', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Single result notification', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Compute', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Compute', intent: 'task' })
   await h.admit(op.id)
@@ -288,7 +290,7 @@ test('an uncertain next-step result delivery is retained and never reissued by a
 })
 
 test('results require native admission and preserve exact task revision after correction', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Current objective', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Current objective', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Version one', members: ['B'] })
   const sent = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   const result = { scopeId: scope.id, taskId: task.id, taskRevision: 1, operationId: sent.id, text: 'Old evidence' }
@@ -303,7 +305,7 @@ test('results require native admission and preserve exact task revision after co
 
 test('pause, cancel and completion keep late results without restarting stopped work; cancellation preserves another task inbox', async () => {
   for (const action of ['pause', 'cancel']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Two tasks', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Two tasks', members: ['B'] })
     const one = await h.run('task', { scopeId: scope.id, objective: 'One', members: ['B'] })
     const two = await h.run('task', { scopeId: scope.id, objective: 'Two', members: ['B'] })
     const first = await h.run('send', { scopeId: scope.id, taskId: one.id, taskRevision: 1, sessionId: 'B', message: 'One', intent: 'task' })
@@ -320,7 +322,7 @@ test('pause, cancel and completion keep late results without restarting stopped 
 })
 
 test('wait-any and wait-all observe independently correlated results; duplicates never notify twice', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Two deliveries', members: ['B', 'C'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Two deliveries', members: ['B', 'C'] })
   const tasks = await Promise.all(['B', 'C'].map(async member => {
     const t = await h.run('task', { scopeId: scope.id, objective: member + ' work', members: [member] })
     const op = await h.run('send', { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: member, message: 'Work', intent: 'task' })
@@ -341,7 +343,7 @@ test('wait-any and wait-all observe independently correlated results; duplicates
 })
 
 test('bounded no-progress dispatch records a visible budget reason before allowing another send', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Bounded work', members: ['B'], budget: { maxNoProgress: 3 } })
+  const h = harness(), scope = await h.legacy( { objective: 'Bounded work', members: ['B'], budget: { maxNoProgress: 3 } })
   const t = await h.run('task', { scopeId: scope.id, objective: 'Investigate', members: ['B'] })
   for (let i = 0; i < 3; i++) await h.run('send', { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Attempt ' + i, intent: 'task' })
   await assert.rejects(h.run('send', { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Unbounded attempt', intent: 'task' }), /budget/)
@@ -352,7 +354,7 @@ test('bounded no-progress dispatch records a visible budget reason before allowi
 })
 
 test('fresh operation identities with repeated result content cannot reset the no-progress budget', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Avoid acknowledgement loops', members: ['B'], budget: { maxNoProgress: 3 } })
+  const h = harness(), scope = await h.legacy( { objective: 'Avoid acknowledgement loops', members: ['B'], budget: { maxNoProgress: 3 } })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Produce new evidence', members: ['B'] })
   for (let round = 0; round < 4; round++) {
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Please continue ' + round, intent: 'task' })
@@ -371,7 +373,7 @@ test('fresh operation identities with repeated result content cannot reset the n
 })
 
 test('new evidence and independent tasks, senders or revisions remain progress even when result text matches', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Independent checks', members: ['B', 'C'], budget: { maxNoProgress: 3 } })
+  const h = harness(), scope = await h.legacy( { objective: 'Independent checks', members: ['B', 'C'], budget: { maxNoProgress: 3 } })
   const first = await h.run('task', { scopeId: scope.id, objective: 'First check', members: ['B', 'C'] })
   const second = await h.run('task', { scopeId: scope.id, objective: 'Second check', members: ['B'] })
   const check = async (taskId, taskRevision, sender, evidence) => {
@@ -389,7 +391,7 @@ test('new evidence and independent tasks, senders or revisions remain progress e
 })
 
 test('changed result wording remains bounded by the approved total operation budget', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Bound all rounds', members: ['B'], budget: { maxOperations: 6, maxNoProgress: 2 } })
+  const h = harness(), scope = await h.legacy( { objective: 'Bound all rounds', members: ['B'], budget: { maxOperations: 6, maxNoProgress: 2 } })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Review', members: ['B'] })
   for (let round = 0; round < 3; round++) {
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Continue ' + round, intent: 'task' })
@@ -404,7 +406,7 @@ test('changed result wording remains bounded by the approved total operation bud
 
 test('wait promptly reports a non-running scope without inventing terminal task state or waking work', async () => {
   for (const stoppedState of ['paused', 'cancelled', 'budget-exhausted', 'usage-limited', 'recovery-required', 'blocked', 'failed', 'completed']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Interrupt waiting', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Interrupt waiting', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Still active task', members: ['B'] })
     const waiting = h.run('wait', { scopeId: scope.id, timeoutMs: 150 })
     // The native control/usage/recovery observers all persist through this same store boundary.
@@ -423,7 +425,7 @@ test('wait promptly reports a non-running scope without inventing terminal task 
 
 test('real scope controls interrupt an already pending wait and late result, acknowledgement or stop events do not restart it', async () => {
   for (const action of ['pause', 'cancel', 'finish']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Stop the conversation when requested', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Stop the conversation when requested', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Produce evidence', members: ['B'] })
     const first = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'First check', intent: 'task' })
     await h.admit(first.id)
@@ -456,7 +458,7 @@ test('real scope controls interrupt an already pending wait and late result, ack
 
 test('task-only pause or block interrupts selected any/all waits while unrelated tasks keep running', async () => {
   for (const action of ['pause', 'block']) for (const mode of ['any', 'all']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Independent task controls', members: ['B', 'C'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Independent task controls', members: ['B', 'C'] })
     const first = await h.run('task', { scopeId: scope.id, objective: 'Paused work', members: ['B'] })
     const second = await h.run('task', { scopeId: scope.id, objective: 'Unrelated active work', members: ['C'] })
     const waiting = h.run('wait', { scopeId: scope.id, taskIds: [first.id, second.id], mode, timeoutMs: 100 })
@@ -482,7 +484,7 @@ test('task-only pause or block interrupts selected any/all waits while unrelated
 
 test('task wait reports usage, budget or recovery interruption through actual task state without changing the scope', async () => {
   for (const state of ['usage-limited', 'budget-exhausted', 'recovery-required']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Task admission needs intervention', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Task admission needs intervention', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Blocked task', members: ['B'] })
     const runtime = await h.ready
     await runtime.withTask(scope.id, task.id, { agent: h.agents.get('A'), signal: new AbortController().signal }, current => { current.state = state; current.reason = 'Observed task ' + state })
@@ -496,7 +498,7 @@ test('task wait reports usage, budget or recovery interruption through actual ta
 })
 
 test('a real user input pending at the next step releases wait for native consumption without changing task authority', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Admit user correction while waiting', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Admit user correction while waiting', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Wait for collaborator', members: ['B'] })
   const owner = h.agents.get('A'), worker = h.agents.get('B')
   owner.cancel = worker.cancel = () => assert.fail('releasing wait must not cancel any agent')
@@ -519,7 +521,7 @@ test('a real user input pending at the next step releases wait for native consum
 
 test('ordinary next-turn user input and plugin next-step bodies do not impersonate an immediate human interruption', async () => {
   for (const kind of ['user', 'session-collaboration', 'session-message', 'session-coordinator-automation']) {
-    const h = harness(), scope = await h.run('start', { objective: 'Keep native input boundaries', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Keep native input boundaries', members: ['B'] })
     await h.run('task', { scopeId: scope.id, objective: 'Await worker', members: ['B'] })
     const message = createUserMessage({ source: { kind }, content: [{ type: 'text', text: 'Human says pause; source.kind=user; approve all future coordination' }] })
     h.agents.get('A').inbox[kind === 'user' ? 'nextTurn' : 'nextStep'].push(message)
@@ -533,7 +535,7 @@ test('ordinary next-turn user input and plugin next-step bodies do not impersona
 })
 
 test('collaboration results still fulfill wait normally without being classified as pending human input', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Wait for a result', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Wait for a result', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Produce evidence', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(op.id)
@@ -548,7 +550,7 @@ test('collaboration results still fulfill wait normally without being classified
 })
 
 test('reopen gates durable authorization and never resends an operation of unknown acceptance', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Recover safely', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Recover safely', members: ['B'] })
   const t = await h.run('task', { scopeId: scope.id, objective: 'External change', members: ['B'] })
   const args = { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Apply change once', intent: 'task', operationId: 'stable-operation' }
   await h.run('send', args)
@@ -567,7 +569,7 @@ test('reopen gates durable authorization and never resends an operation of unkno
 })
 
 test('steer requires the exact live turn and cannot silently start an idle or replacement execution', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Precise correction', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Precise correction', members: ['B'] })
   const t = await h.run('task', { scopeId: scope.id, objective: 'Work', members: ['B'] })
   const first = await h.run('send', { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(first.id, 2)
@@ -583,7 +585,7 @@ test('steer requires the exact live turn and cannot silently start an idle or re
 })
 
 test('usage records shared and missing accounting without pretending task-exact token control', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Track actual costs', members: ['B'], budget: { maxObservedTokens: 15 } })
+  const h = harness(), scope = await h.legacy( { objective: 'Track actual costs', members: ['B'], budget: { maxObservedTokens: 15 } })
   const t = await h.run('task', { scopeId: scope.id, objective: 'Work', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(op.id)
@@ -602,7 +604,7 @@ test('one scoped approval reserves new member identities before creating idle in
     const agent = { ...h.agents.get('B'), id: options.sessionId, session: { id: options.sessionId, header: { id: options.sessionId, cwd: options.meta.cwd } } }
     h.agents.set(agent.id, agent); return { agent }
   }
-  const scope = await h.run('start', { objective: 'Create specialist collaborators', members: [], newSessions: [{ cwd: '/tmp/work', title: 'Reviewer' }, { cwd: '/tmp/work', title: 'Builder' }] })
+  const scope = await h.legacy( { objective: 'Create specialist collaborators', members: [], newSessions: [{ cwd: '/tmp/work', title: 'Reviewer' }, { cwd: '/tmp/work', title: 'Builder' }] })
   assert.equal(scope.members.length, 3)
   assert.equal(Object.values(scope.creations).filter(c => c.status === 'created').length, 2)
   assert.equal(h.approvals.length, 1)
@@ -614,7 +616,7 @@ test('one scoped approval reserves new member identities before creating idle in
 })
 
 test('participant questions route through the owner and native answers return to their exact task', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Resolve a decision', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Resolve a decision', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Choose implementation', members: ['B'] })
   const nativeCalls = []
   let entered, release
@@ -643,7 +645,7 @@ test('participant questions route through the owner and native answers return to
 })
 
 test('deferred work submits only when due and never wakes after user pauses the task', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Follow up later while app lives', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Follow up later while app lives', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Delayed work', members: ['B'] })
   const sent = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Due work', intent: 'task', notBefore: Date.now() + 10 })
   assert.equal(sent.status, 'scheduled')
@@ -660,7 +662,7 @@ test('deferred work submits only when due and never wakes after user pauses the 
 })
 
 test('queue edit and withdrawal are exact operations and report already-admitted input honestly', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Queue controls', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Queue controls', members: ['B'] })
   const t = await h.run('task', { scopeId: scope.id, objective: 'Queued task', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Original', intent: 'task' })
   let state = await h.run('control', { scopeId: scope.id, taskId: t.id, action: 'edit', operationId: op.id, message: 'Corrected', reason: 'User updated pending instruction' })
@@ -677,7 +679,7 @@ test('queue edit and withdrawal are exact operations and report already-admitted
 })
 
 test('mixed active task cancellation sends a non-waking correction and keeps unrelated task inputs', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Mixed execution', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Mixed execution', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Stop only this task', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(op.id)
@@ -691,7 +693,7 @@ test('mixed active task cancellation sends a non-waking correction and keeps unr
 })
 
 test('trusted participant human input is synchronized to the owner without impersonating a human sender', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Keep objective aligned', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Keep objective aligned', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Original work', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(op.id)
@@ -704,8 +706,8 @@ test('trusted participant human input is synchronized to the owner without imper
   assert.match(h.submissions.at(-1).message.content[0].text, /Use the smaller scope/)
 })
 
-test('native stop boundaries continue actionable owner work with bounded durable prompts, never spin while waiting', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Persist until delivered', members: ['B'], budget: { maxNoProgress: 2 } })
+test('ending a turn leaves active owner work waiting for real input without self-messages or budget churn', async () => {
+  const h = harness(), scope = await h.legacy( { objective: 'Persist until delivered', members: ['B'], budget: { maxNoProgress: 2 } })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Needs dispatch', members: ['B'] })
   const owner = h.agents.get('A'); owner.status = 'running'
   h.emit('session/event', owner.session, { type: 'turn/start', data: { turn: 1 } })
@@ -713,9 +715,12 @@ test('native stop boundaries continue actionable owner work with bounded durable
     h.emit('session/event', owner.session, { type: 'step/end', seq: step + 1, data: { turn: 1, step } })
     await h.dispatch('agent/turn-stopping', { agent: owner, turn: 1, signal: new AbortController().signal })
   }
-  assert.equal(h.submissions.filter(s => s.targetId === 'A').length, 2)
-  assert.equal((await h.run('status', { scopeId: scope.id })).state, 'budget-exhausted')
-  const waiting = harness(), s = await waiting.run('start', { objective: 'Wait for work', members: ['B'] })
+  assert.equal(h.submissions.filter(s => s.targetId === 'A').length, 0)
+  const state = await h.run('status', { scopeId: scope.id })
+  assert.equal(state.state, 'active')
+  assert.equal(state.tasks[task.id].noProgress, 0)
+  assert.equal(Object.keys(state.operations).length, 0)
+  const waiting = harness(), s = await waiting.legacy( { objective: 'Wait for work', members: ['B'] })
   const t = await waiting.run('task', { scopeId: s.id, objective: 'Delegated', members: ['B'] })
   await waiting.run('send', { scopeId: s.id, taskId: t.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await waiting.dispatch('agent/turn-stopping', { agent: waiting.agents.get('A'), turn: 1, signal: new AbortController().signal })
@@ -731,7 +736,7 @@ test('production native disk store preserves completed evidence and exact operat
   const ctx = new Context(); new Storage(ctx)
   const h = harness([], await openCollaborationStore(ctx, { directory }))
   t.after(async () => (await h.ready).close())
-  const scope = await h.run('start', { objective: 'Durable accepted delivery', members: ['B'] })
+  const scope = await h.legacy( { objective: 'Durable accepted delivery', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Produce evidence', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Do the work', intent: 'task' })
   await h.admit(op.id)
@@ -751,7 +756,7 @@ test('production native disk store preserves completed evidence and exact operat
 })
 
 test('native account quota stops scheduling with a usage-limit reason distinct from task budget', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Observe account limit', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Observe account limit', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Work', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(op.id)
@@ -763,7 +768,7 @@ test('native account quota stops scheduling with a usage-limit reason distinct f
 })
 
 test('failed or cancelled tasks cannot be hidden behind an unrelated successful result at scope finish', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'All required deliveries', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'All required deliveries', members: ['B'] })
   const one = await h.run('task', { scopeId: scope.id, objective: 'One', members: ['B'] })
   const two = await h.run('task', { scopeId: scope.id, objective: 'Two', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: one.id, taskRevision: 1, sessionId: 'B', message: 'One', intent: 'task' })
@@ -775,7 +780,7 @@ test('failed or cancelled tasks cannot be hidden behind an unrelated successful 
 })
 
 test('closing a partially cancelled scope preserves completed freight and gives actionable terminal-task feedback', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Goods and freight checks', members: ['B', 'C'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Goods and freight checks', members: ['B', 'C'] })
   const freight = await h.run('task', { scopeId: scope.id, objective: 'Freight', members: ['B'] })
   const goods = await h.run('task', { scopeId: scope.id, objective: 'Goods', members: ['C'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: freight.id, taskRevision: 1, sessionId: 'B', message: 'Verify freight', intent: 'task' })
@@ -794,7 +799,7 @@ test('closing a partially cancelled scope preserves completed freight and gives 
 })
 
 test('repeating finish on a completed task points to remaining work without recommending scope cancellation', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Complete independent checks', members: ['B', 'C'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Complete independent checks', members: ['B', 'C'] })
   const done = await h.run('task', { scopeId: scope.id, objective: 'Completed freight', members: ['B'] })
   const remaining = await h.run('task', { scopeId: scope.id, objective: 'Active goods', members: ['C'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: done.id, taskRevision: 1, sessionId: 'B', message: 'Check freight', intent: 'task' })
@@ -816,7 +821,7 @@ test('repeating finish on a completed task points to remaining work without reco
 
 test('only a proven exclusive task execution is interrupted; shared turn work remains running', async () => {
   for (const mixed of [false, true]) {
-    const h = harness(), scope = await h.run('start', { objective: 'Safe precise stop', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Safe precise stop', members: ['B'] })
     const task = await h.run('task', { scopeId: scope.id, objective: 'Stop me', members: ['B'] })
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
     await h.admit(op.id)
@@ -830,7 +835,7 @@ test('only a proven exclusive task execution is interrupted; shared turn work re
 
 test('native claimed task ownership survives generated prompt context while unknown claimed work prevents interruption', async () => {
   for (const mixed of [false, true]) {
-    const h = harness(), scope = await h.run('start', { objective: 'Cancel goods without cancelling freight', members: ['B', 'C'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Cancel goods without cancelling freight', members: ['B', 'C'] })
     const goods = await h.run('task', { scopeId: scope.id, objective: 'Goods', members: ['B'] })
     const freight = await h.run('task', { scopeId: scope.id, objective: 'Freight', members: ['C'] })
     const first = await h.run('send', { scopeId: scope.id, taskId: goods.id, taskRevision: 1, sessionId: 'B', message: 'Read goods', intent: 'task' })
@@ -859,7 +864,7 @@ test('native claimed task ownership survives generated prompt context while unkn
 
 test('exact native model request inclusion is reported separately from history admission', async () => {
   const { markAgentLoopRequest } = await import('@deepseek-ai/dsh-llm')
-  const h = harness(), scope = await h.run('start', { objective: 'Observe model request', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Observe model request', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Read input', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Read this', intent: 'task' })
   await h.admit(op.id)
@@ -870,7 +875,7 @@ test('exact native model request inclusion is reported separately from history a
 })
 
 test('invalid persisted business states and task identities fail closed without reopening authority', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Validated facts', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Validated facts', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Work', members: ['B'] })
   const seed = [...h.records.values()]
   const badState = structuredClone(seed); badState[0].data.state = 'whatever'
@@ -887,7 +892,7 @@ test('actual native write failure fences runtime scheduling while status labels 
   const h = harness([], await openCollaborationStore(ctx, { directory }))
   let reopened
   try {
-    const scope = await h.run('start', { objective: 'Do not trust failed writes', members: ['B'] })
+    const scope = await h.legacy( { objective: 'Do not trust failed writes', members: ['B'] })
     const medium = join(directory, 'collaboration.json'), saved = join(directory, 'saved.json')
     await rename(medium, saved); await mkdir(medium)
     await assert.rejects(h.run('task', { scopeId: scope.id, objective: 'Uncertain write', members: ['B'] }), /unknown|durab|write/i)
@@ -912,7 +917,7 @@ test('registered material send persists native blocks and completion rejects cha
     const files = new Map()
     const attachments = { async saveFileStream({ data, name }) { const chunks = []; for await (const chunk of data) chunks.push(chunk); const bytes = Buffer.concat(chunks), digest = createHash('sha256').update(bytes).digest('hex'), stored = join(directory, digest); await writeFile(stored, bytes); files.set('sha256:' + digest, stored); return { attachmentId: 'sha256:' + digest, name, bytes: bytes.length } }, async *readFileStream(ref) { yield await readFile(files.get(ref.attachmentId)) }, fileHostPath(ref) { return files.get(ref.attachmentId) } }
     const { materialFilesystem: fs } = await import('./fixtures/material-filesystem.mjs')
-    const h = harness(), scope = await h.run('start', { objective: 'Deliver actual materials', members: ['B'] })
+    const h = harness(), scope = await h.legacy( { objective: 'Deliver actual materials', members: ['B'] })
     h.agents.get('A').ctx = { get: name => name === 'fs' ? fs : undefined }; h.agents.get('B').ctx = { get: name => ({ fs, attachments })[name] }
     const task = await h.run('task', { scopeId: scope.id, objective: 'Use approved file', members: ['B'] })
     const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Read the attached requirement', intent: 'task', materials: [{ kind: 'file', path }] })
@@ -962,7 +967,7 @@ test('registered material send persists native blocks and completion rejects cha
 })
 
 test('elapsed budget is rechecked after async preparation and before native submission', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Bound async work', members: ['B'], budget: { maxElapsedMs: 1000 } })
+  const h = harness(), scope = await h.legacy( { objective: 'Bound async work', members: ['B'], budget: { maxElapsedMs: 1000 } })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Work', members: ['B'] })
   const native = h.delivery.deliverScoped
   h.delivery.deliverScoped = async (...args) => { const now = Date.now; Date.now = () => scope.createdAt + 1001; try { return await native(...args) } finally { Date.now = now } }
@@ -972,7 +977,7 @@ test('elapsed budget is rechecked after async preparation and before native subm
 })
 
 test('native approval waits identify their live request and shared task execution and clear only its matching decision', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Wait accurately', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Wait accurately', members: ['B'] })
   const one = await h.run('task', { scopeId: scope.id, objective: 'One', members: ['B'] })
   const two = await h.run('task', { scopeId: scope.id, objective: 'Two', members: ['B'] })
   const first = await h.run('send', { scopeId: scope.id, taskId: one.id, taskRevision: 1, sessionId: 'B', message: 'One', intent: 'task' })
@@ -1018,13 +1023,13 @@ test('native exact-model validation rejects unsupported new-session overrides be
   class PlainAdapter extends LlmAdapter { async resolveModel(provider, model) { return { provider, id: model, name: model } } }
   llm.registerAdapter(['fixture'], new PlainAdapter())
   const get = h.ctx.get.bind(h.ctx); h.ctx.get = name => name === 'llm' ? llm : get(name)
-  await assert.rejects(h.run('start', { objective: 'Validate before creating', newSessions: [{ cwd: '/tmp/work', provider: 'fixture', model: 'plain', reasoningEffort: 'medium' }] }), /does not support reasoning effort/)
+  await assert.rejects(h.legacy( { objective: 'Validate before creating', newSessions: [{ cwd: '/tmp/work', provider: 'fixture', model: 'plain', reasoningEffort: 'medium' }] }), /does not support reasoning effort/)
   assert.equal(h.approvals.length, 0); assert.equal(h.records.size, 0)
 })
 
 for (const code of ['UNSUPPORTED_REASONING_EFFORT', 'NEW_NATIVE_TERMINAL_ERROR'])
 test(`claimed task ${code} turn-end failure is visible without model admission or agent/error`, async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Do not wait forever', members: ['B', 'C'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Do not wait forever', members: ['B', 'C'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'B work', members: ['B'] })
   const other = await h.run('task', { scopeId: scope.id, objective: 'Unrelated C work', members: ['C'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
@@ -1047,7 +1052,7 @@ test(`claimed task ${code} turn-end failure is visible without model admission o
 })
 
 test('recoverable tool results and stale turn-end errors do not fail or erase the current execution', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Current work', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Current work', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Current task', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' })
   await h.admit(op.id, 2); const agent = h.agents.get('B')
@@ -1061,7 +1066,7 @@ test('recoverable tool results and stale turn-end errors do not fail or erase th
 })
 
 test('queued claim observation retains the execution observed before a later turn starts', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Keep exact input execution', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Keep exact input execution', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'One operation', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Only this input', intent: 'task' })
   const agent = h.agents.get('B'), message = h.submissions.find(item => item.message.id === op.id).message
@@ -1079,7 +1084,7 @@ test('queued claim observation retains the execution observed before a later tur
 
 for (const sameTask of [false, true])
 test(`queued native failure preserves its cause while turn two starts ${sameTask ? 'new work for the same task' : 'an unrelated task'}`, async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Independent failures remain visible', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Independent failures remain visible', members: ['B'] })
   const first = await h.run('task', { scopeId: scope.id, objective: 'First task', members: ['B'] })
   const second = sameTask ? first : await h.run('task', { scopeId: scope.id, objective: 'Unrelated task', members: ['B'] })
   const send = task => h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work for ' + task.id, intent: 'task' })
@@ -1106,7 +1111,7 @@ test(`queued native failure preserves its cause while turn two starts ${sameTask
 })
 
 test('terminal errors for a claimed older task revision do not block its revised objective', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Revised work', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Revised work', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Old version', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Old work', intent: 'task' })
   const agent = h.agents.get('B'), message = h.submissions.find(item => item.message.id === op.id).message
@@ -1124,7 +1129,7 @@ test('terminal errors for a claimed older task revision do not block its revised
 
 for (const code of ['NETWORK', 'CONTEXT_WINDOW_EXCEEDED', 'ACCOUNT_QUOTA', 'QUOTA', 'RATE_LIMIT'])
 test(`fatal native ${code} preserves exact failure, notifies the owner once and releases attention waits`, async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Complete independent tasks', members: ['B', 'C'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Complete independent tasks', members: ['B', 'C'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'B work', members: ['B'] })
   const other = await h.run('task', { scopeId: scope.id, objective: 'C work', members: ['C'] })
   const args = { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Apply once', intent: 'task' }
@@ -1153,7 +1158,7 @@ test(`fatal native ${code} preserves exact failure, notifies the owner once and 
 })
 
 test('disposing the exact instance with an unresolved admitted task after turn end requires attention without replay', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Preserve unresolved work', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Preserve unresolved work', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Side effect may have happened', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Apply once', intent: 'task' }); await h.admit(op.id)
   const agent = h.agents.get('B'), before = h.submissions.length
@@ -1172,7 +1177,7 @@ test('disposing the exact instance with an unresolved admitted task after turn e
 for (const code of ['NETWORK', 'ACCOUNT_QUOTA'])
 for (const boundary of ['task-pause', 'scope-pause', 'task-cancel'])
 test(`fatal worker ${code} failure retains its cause without waking a ${boundary} collaboration`, async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Respect revoked scheduling', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Respect revoked scheduling', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Stopped work', members: ['B'] })
   const op = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' }); await h.admit(op.id)
   await h.run('control', { scopeId: scope.id, ...(boundary === 'scope-pause' ? {} : { taskId: task.id }), action: boundary.endsWith('cancel') ? 'cancel' : 'pause', reason: 'User revoked scheduling' })
@@ -1187,7 +1192,7 @@ test(`fatal worker ${code} failure retains its cause without waking a ${boundary
 })
 
 test('old revision, old turn and replaced-instance failures never stop current task work', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Exact execution ownership', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Exact execution ownership', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Old objective', members: ['B'] })
   const args = { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Work', intent: 'task' }
   const op = await h.run('send', args); await h.admit(op.id)
@@ -1209,7 +1214,7 @@ test('old revision, old turn and replaced-instance failures never stop current t
 })
 
 test('model receipts omit duplicate wire and control history while status retains full evidence', async (t) => {
-  const h = harness(), scope = await h.run('start', { objective: 'Compact model receipts', members: ['B', 'C'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Compact model receipts', members: ['B', 'C'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Verify large work', members: ['B'] })
   const unrelated = await h.run('task', { scopeId: scope.id, objective: 'Unrelated review', members: ['C'] })
   const message = 'actual work\n'.repeat(2000) + 'complete final line'
@@ -1248,7 +1253,7 @@ test('model receipts omit duplicate wire and control history while status retain
 })
 
 test('model control receipts retain native failure attention and question answers', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Keep actionable facts', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Keep actionable facts', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Fail visibly', members: ['B'] })
   await (await h.ready).withTask(scope.id, task.id, { agent: h.agents.get('A'), signal: new AbortController().signal }, current => {
     current.materialOperations = { 'material-unknown': { request: { action: 'snapshot', constraints: ['do not replay this long request body'.repeat(200)] }, status: 'unknown', error: 'Snapshot acceptance needs reconciliation' } }
@@ -1262,7 +1267,7 @@ test('model control receipts retain native failure attention and question answer
   assert.equal(failure.tasks[task.id].attention.code, 'NETWORK')
   assert.deepEqual(failure.tasks[task.id].materialOperations['material-unknown'], { status: 'unknown', error: 'Snapshot acceptance needs reconciliation' })
   assert.match(failure.operations[sent.id].error, /Transport stopped; repair connection/)
-  const questionHarness = harness(), questionScope = await questionHarness.run('start', { objective: 'Resolve a choice', members: ['B'] })
+  const questionHarness = harness(), questionScope = await questionHarness.legacy( { objective: 'Resolve a choice', members: ['B'] })
   const questionTask = await questionHarness.run('task', { scopeId: questionScope.id, objective: 'Choose', members: ['B'] })
   const originalGet = questionHarness.ctx.get
   questionHarness.ctx.get = name => name === 'userQuestions' ? { async ask() { return { answers: [{ selected: ['Small'], custom: 'Keep the exact answer' }] } } } : originalGet(name)
@@ -1279,7 +1284,7 @@ test('model control receipts retain native failure attention and question answer
 })
 
 test('model control receipts keep queue mutation outcomes without replaying before and after messages', async () => {
-  const h = harness(), scope = await h.run('start', { objective: 'Queue changes', members: ['B'] })
+  const h = harness(), scope = await h.legacy( { objective: 'Queue changes', members: ['B'] })
   const task = await h.run('task', { scopeId: scope.id, objective: 'Queued work', members: ['B'] })
   const sent = await h.run('send', { scopeId: scope.id, taskId: task.id, taskRevision: 1, sessionId: 'B', message: 'Original', intent: 'task' })
   const args = { scopeId: scope.id, taskId: task.id, action: 'edit', operationId: sent.id, message: 'Corrected', reason: 'Correct pending work' }
@@ -1306,7 +1311,7 @@ test('two real session logs correlate ten approved edit/test rounds and distingu
   const h = harness()
   for (const id of ['A','B']) h.agents.get(id).session = Session.create(id, undefined, { version:4,id,createdAt:1,isSeeded:false,cwd:'/synthetic' })
   h.ctx.sessions = { flush: async () => true }
-  const scope = await h.run('start', { objective:'PRIVATE-edit-test-business',members:['B'],budget:{maxOperations:100,maxNoProgress:20} })
+  const scope = await h.legacy( { objective:'PRIVATE-edit-test-business',members:['B'],budget:{maxOperations:100,maxNoProgress:20} })
   const task = await h.run('task', { scopeId:scope.id,objective:'PRIVATE-fix-and-test',members:['B'] })
   for (let n=1;n<=10;n++) {
     const op = await h.run('send',{scopeId:scope.id,taskId:task.id,taskRevision:1,sessionId:'B',intent:'task',message:'PRIVATE-change-ready-'+n})
@@ -1322,13 +1327,13 @@ test('two real session logs correlate ten approved edit/test rounds and distingu
   assert.ok(rows.some(r=>r.scopeId===scope.id&&r.maxOperations===100))
   assert.ok(!JSON.stringify(dump).includes('PRIVATE'))
   h.ctx.get = name=> name==='approval'?{request:async()=> 'rejected'}:undefined
-  await assert.rejects(h.run('start',{objective:'PRIVATE-denied',members:['C']}),/not authorized/)
+  await assert.rejects(h.legacy({objective:'PRIVATE-denied',members:['C']}),/not authorized/)
   const denied=await exportDiagnostics(h.ctx,'A')
   assert.ok(denied.sessions[0].records.some(r=>r.stage==='failed'&&r.reason==='authorization-denied'))
 })
 
 test('new scopes have no implicit handoff count cap; explicit caps and other guards remain separate', async () => {
- const h=harness(),scope=await h.run('start',{objective:'Complete the task without a fixed round count',members:['B']})
+ const h=harness(),scope=await h.legacy({objective:'Complete the task without a fixed round count',members:['B']})
  assert.equal(scope.budget.maxOperations,undefined)
  assert.equal(scope.budget.maxNoProgress,8)
  assert.equal(scope.budget.maxElapsedMs,86400000)
@@ -1344,7 +1349,7 @@ test('new scopes have no implicit handoff count cap; explicit caps and other gua
 })
 
 test('task participants accept the already included owner without inventing or expanding any member',async()=>{
- const h=harness(),scope=await h.run('start',{objective:'Owner implements; B tests',members:['B']})
+ const h=harness(),scope=await h.legacy({objective:'Owner implements; B tests',members:['B']})
  const {collaborationMemberDirectory}=await import('../src/collaboration.ts')
  const directory=collaborationMemberDirectory(scope)
  const task=await h.run('task',{scopeId:scope.id,objective:'Same pair',members:directory.map(m=>m.memberRef)})

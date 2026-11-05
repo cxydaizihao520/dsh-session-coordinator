@@ -1,3 +1,10 @@
+import { registerCurrentSessionTool, type SessionToolSurface } from './session-tool-surface.ts'
+import { createSendRequestConsumer } from './session-send-request.ts'
+import { sessionContentSchema, type SessionContent } from './session-content.ts'
+import { sessionWaitCursor, sessionWaitTarget, waitSessions, type SessionWaitTarget } from './session-wait.ts'
+import { controlAuthorizationSchema, registerSessionControl } from './session-control.ts'
+import { createRequestConsumer, type CreateRequestArgs } from './session-create-request.ts'
+import { throwIfCollaborationAborted } from './core.ts'
 import { diagnosticTool, observeDiagnostics } from './diagnostics.ts'
 /**
  * dsh-session-coordinator 模型面向工具：create / send / resume / wait / read / find。
@@ -33,10 +40,9 @@ import {
   workspaceBySession,
 } from './core.ts'
 import { createBridgeSession, resumeBridgeSession, validateBridgeSessionModel, type ResumeArgs, type BridgeSessionCaller } from './session-create.ts'
-import { HOP_RULE_TEXT } from './hop.ts'
-import { registerReceipt } from './receipts.ts'
+import { readMessageReceipt, registerReceipt } from './receipts.ts'
 import { requireCoordination, type CoordinationGrants } from './coordinate.ts'
-import { SessionDelivery, InformationDeliveryError, requestCoordinationApproval } from './delivery.ts'
+import { SessionDelivery, InformationDeliveryError, requestCoordinationApproval, type ControlScopeRequest } from './delivery.ts'
 import type { BridgeRegistry } from './registry.ts'
 import type { SessionMonitor, MonitorConfig, MonitorEntryState, CoTRule } from './monitor.ts'
 import type { LoopPolicy } from './config.ts'
@@ -52,7 +58,9 @@ export interface BridgeEnv {
   policy: LoopPolicy
   /** 会话级协调授权（见 coordinate.ts）：跨会话动作必须由用户先授权。 */
   grants: CoordinationGrants
+  collaboration?: Promise<import('./collaboration.ts').CollaborationRuntime>
   delivery?: SessionDelivery
+  toolSurface?: SessionToolSurface
 }
 
 function asJson(value: unknown): Record<string, JsonValue> {
@@ -60,6 +68,7 @@ function asJson(value: unknown): Record<string, JsonValue> {
 }
 
 const MAX_WAIT_MS = 3_600_000
+const DELIVERY_DESCRIPTION = 'message (default) starts an idle chat or adds input at the next safe step without interrupting its running tool. queue waits until the ENTIRE current turn ends; a tool returning or the next safe step is not the next turn. For “下一轮/等这一轮做完再处理” explicitly choose queue. context retains information without waking the chat. Strict steer requires the current expectedExecution and cannot start a new turn.'
 
 function clampTimeout(ms: number | undefined, fallback = 180_000): number {
   if (ms === undefined) return fallback
@@ -119,7 +128,7 @@ async function approveOnce(env: BridgeEnv, exec: { agent?: unknown; signal: Abor
   await requestCoordinationApproval(env.ctx, exec, toolName, 'Approve this one collaboration action only: ' + JSON.stringify(payload))
 }
 
-interface CreateArgs {
+interface CreateArgs extends CreateRequestArgs {
   replyHandling?: 'continue' | 'receive-only'
   workspaceId?: string
   cwd?: string
@@ -134,26 +143,38 @@ interface CreateArgs {
 }
 
 function registerCreate(env: BridgeEnv): void {
-  env.ctx.tools.register(diagnosticTool(env.ctx, defineTool({
+  const createRequest = createRequestConsumer(env)
+  registerCurrentSessionTool(env, diagnosticTool(env.ctx, defineTool({
     name: 'session_coordinator_create',
-    description: 'Create a real independent main chat, visible in the sidebar with its own history and available for later conversation. Use for a user-requested new chat/session (新会话/独立会话), rather than a temporary team/subagent. This entry grants native approval for one task/reply only; for joint delivery, review/rework or continued rounds use collaboration_start with newSessions. Defaults to the current workspace/model. Asynchronous by default; waitForReply waits for this task reply, not assistant text. On uncertain creation/delivery inspect the returned identity; do not create another chat or resend automatically.',
+    description: 'Create a real independent main chat, visible in the sidebar with its own history and available for later conversation. Use for a user-requested new chat/session (新会话/独立会话), rather than a temporary team/subagent. Omit initialMessage to create an empty chat without starting the model; creation and first-message admission are reported separately, and a stable requestId never creates a replacement. Native approval includes the optional first message and requested one reply; for continued rounds use initialMessage.authorizationRequest.extent=work; ordinary communication needs no declared task. Defaults to the current workspace/model. V2 create is asynchronous: do not pass waitForReply; use the returned initialMessage.afterCursor and messageId with wait targets/replyTo. On uncertain creation/delivery inspect the returned identity; do not create another chat or resend automatically.',
     parameters: {
       workspaceId: { type: 'string', description: 'Target workspace id (from session_coordinator_find). Takes precedence over cwd.' },
       cwd: { type: 'string', description: 'Target working directory for the new session (absolute path or any spelling).' },
       title: { type: 'string', description: 'Optional name for the new session, applied to the native sidebar when the host title service is available; also remembered for find-by-name.' },
-      prompt: { type: 'string', required: true, description: 'First task, delivered once through the verified reply chain.' },
+      prompt: { type: 'string', description: 'Legacy first task. Do not combine with requestId or initialMessage.' },
+      requestId: { type: 'string', description: 'Stable creation identity; retries retain the same created chat.' },
+      initialMessage: { type: 'object', additionalProperties: false, properties: {
+        content: { ...sessionContentSchema, required: true }, delivery: { type: 'string', enum: ['message', 'queue', 'context', 'steer'], description: DELIVERY_DESCRIPTION }, expectedExecution: { type: 'string', description: 'Required for strict steer; a newly idle chat has no running execution, so strict steer is rejected rather than starting it.' },
+        context: { type: 'object', additionalProperties: false, properties: { communicationHandle: { type: 'string', required: true } }, description: 'Only an existing permission already including this exact created identity; never extends its members.' },
+        replyHandling: { type: 'string', enum: ['continue', 'receive-only'] }, authorizationRequest: { type: 'object', additionalProperties: false, properties: {
+          participants: { type: 'array', items: { type: 'string' }, description: 'Optional additional exact existing members for work. Native approval always includes the actual caller and newly allocated session ID; never invent a placeholder ID.' },
+          purpose: { type: 'string', required: true }, extent: { type: 'string', enum: ['message', 'work'], required: true }, reply: { type: 'string', enum: ['none', 'once'] },
+          controls: controlAuthorizationSchema,
+        } },
+      }, description: 'Optional exact first message, sharing send modes and permission semantics. Omit for an empty chat without model invocation. For one requested business report explicitly request {purpose, extent:message, reply:once}; default none grants no reply. Use extent:work for continued exchanges. Creation and its first-message permission share one native approval bound to the actual new ID.' },
       replyHandling: { type: 'string', enum: ['continue', 'receive-only'], description: 'How the originator receives the reply; defaults to continue.' },
       agentPreset: { type: 'string', description: 'Optional agent preset id for composition.' },
       provider: { type: 'string', description: 'Omit to inherit the calling chat’s provider. Override only for an explicit need after verifying the target provider/model route is available.' },
       model: { type: 'string', description: 'Omit to inherit the calling chat’s model. Override only for an explicit need after verifying the exact model is available on the selected provider.' },
       reasoningEffort: { type: 'string', description: 'Omit to inherit the caller’s configured effort. Override only for an explicit need after verifying the selected provider/model supports the exact value. Effort levels are model-specific; do not assume a universal low/medium/high enum or silently substitute a fallback.' },
-      waitForReply: { type: 'boolean', description: 'When true and prompt is given, wait for this task’s correlated reply (default false).' },
-      timeoutMs: { type: 'number', description: 'Wait timeout in milliseconds (default 180000, max 3600000).' },
+      waitForReply: { type: 'boolean', description: 'LEGACY prompt only. Never pass this key (even false) with initialMessage or requestId; v2 create returns immediately, then use session_coordinator_wait targets with initialMessage.afterCursor and replyTo=initialMessage.messageId.' },
+      timeoutMs: { type: 'number', description: 'Legacy prompt/waitForReply only; omit for v2 create. Set the timeout on a separate wait call instead.' },
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => {
         const v = value as Record<string, unknown>
+        if (v.protocolVersion === 2) return [{ type: 'text' as const, text: JSON.stringify(v) }]
         const lines: string[] = [`created main session ${String(v.sessionId)}`]
         if (typeof v.cwd === 'string') lines.push(`cwd: ${v.cwd}`)
         if (typeof v.title === 'string') lines.push(`title: ${v.title}`)
@@ -167,6 +188,7 @@ function registerCreate(env: BridgeEnv): void {
       },
     },
     async execute(args: CreateArgs, exec) {
+      if (args.prompt === undefined || args.initialMessage !== undefined || args.requestId !== undefined) return asJson(await createRequest(args, exec))
       args = structuredClone(args)
       const caller = exec.agent as LiveAgentLike | undefined
       if (caller === undefined || !exec.callId) throw new Error('cannot determine creating session/call')
@@ -183,18 +205,18 @@ function registerCreate(env: BridgeEnv): void {
       const requestId = 'create-' + createHash('sha256').update(JSON.stringify([caller.id, exec.callId])).digest('hex')
       const sessionId = 'sb-' + requestId
       await approveOnce(env, exec, 'session_coordinator_create', { ...args, cwd, sessionId })
-      check(); exec.signal.throwIfAborted()
+      check(); throwIfCollaborationAborted(exec.signal)
       await recordCreation(env.ctx, caller.session, requestId, sessionId, cwd)
-      check(); exec.signal.throwIfAborted()
+      check(); throwIfCollaborationAborted(exec.signal)
       let created
       try {
         created = await createBridgeSession(env.ctx, env.registry, {
           ...args, prompt: undefined, sessionId, cwd, callerCwd: caller.session.header.cwd, signal: exec.signal,
           caller: { ctx: caller.ctx, session: caller.session as unknown as BridgeSessionCaller['session'] },
         })
-        check(); exec.signal.throwIfAborted()
+        check(); throwIfCollaborationAborted(exec.signal)
         const sent = await env.delivery!.send({ sessionId, message: prompt, replyHandling: args.replyHandling }, caller, undefined,
-          { authorize: async () => { check(); exec.signal.throwIfAborted() }, signal: exec.signal, messageId: requestId })
+          { authorize: async () => { check(); throwIfCollaborationAborted(exec.signal) }, signal: exec.signal, messageId: requestId })
         const reply = args.waitForReply === true ? await env.delivery!.waitForRequest(caller.id, sessionId, sent.messageId, timeout, exec.signal) : undefined
         return asJson({ ...sent, cwd: created.cwd, ...(args.title === undefined ? {} : { title: args.title }), ...(created.workspaceId === undefined ? {} : { workspaceId: created.workspaceId }), ...(reply === undefined ? {} : { reply }) })
       } catch (error) {
@@ -202,10 +224,16 @@ function registerCreate(env: BridgeEnv): void {
           ', creationConfirmed=' + String(created !== undefined) + ': ' + (error instanceof Error ? error.message : String(error)))
       }
     }
-  })))
+  })), ['prompt', 'replyHandling', 'waitForReply', 'timeoutMs'])
 }
 
-interface SendArgs {
+export interface SendArgs {
+  expectedExecution?: string
+  context?: { communicationHandle: string; taskHandle?: string }
+  targets?: string[]
+  content?: SessionContent
+  delivery?: 'message' | 'queue' | 'context' | 'steer'
+  authorizationRequest?: { participants: string[]; purpose: string; extent: 'message' | 'work'; reply?: 'none' | 'once'; controls?: ControlScopeRequest }
   intent?: 'information'
   requestId?: string
   retryFailed?: boolean
@@ -222,17 +250,29 @@ interface SendArgs {
 
 function registerSend(env: BridgeEnv): void {
   const batches = new Map<string, { fingerprint: string; run: Promise<Record<string, unknown>> }>()
-  env.ctx.tools.register(diagnosticTool(env.ctx, defineTool({
+  const sendRequest = createSendRequestConsumer(env)
+  registerCurrentSessionTool(env, diagnosticTool(env.ctx, defineTool({
     name: 'session_coordinator_send',
-    description: 'Legacy one-task/reply or information delivery; source.kind=session-collaboration uses collaboration_send/result instead and has its own approved multi-round scope. Deliver an outgoing task with existing target authorization or native approval for this one call, or the ONE eligible reply to a verified legacy incoming task. For an eligible reply use its sender session id and task messageId. A received result-context is the result already delivered to its originator; receive-only results are context without a separate summary, while other results complete the human task. mode=steer (default) schedules the next step without aborting; mode=queue schedules the next turn. Offline targets resume after permission is checked. waitForReply=true waits for the correlated task reply, not assistant text or idleness. A terminal legacy reply never waits for another reply. ' + HOP_RULE_TEXT,
+    description: 'Send to an existing independent chat and reply through this same entry. Use targets plus content; copy exact session identities from find/read and replyTo from the incoming message. Ordinary one-request/one-reply needs no task/result registration. For a requested business report explicitly choose message extent with reply=once; the default none is only a notification and grants no reply. Native approval establishes message (optional once reply) or work (repeated exchanges within named members and purpose); work needs no task/result/close and no fixed hop count. Returns durable admission, not business completion; unknown must be inspected without changing requestId. After reload, repeating the exact original request only reconciles historical receipts; it never restores permission or resends. Exact single/group targets support message (default), queue (next turn), context (no wakeup), or strict steer (requires current status.executionId).',
     parameters: {
+      context: { type: 'object', additionalProperties: false, properties: { communicationHandle: { type: 'string', required: true }, taskHandle: {type:'string'} }, description: 'Select an existing approved work permission. Mutually exclusive with authorizationRequest.' },
+      targets: { type: 'array', items: { type: 'string' }, description: 'Exact recipient IDs from find/read; duplicates and self are removed. Freeze the complete list before approval and retain it for retries.' },
+      content: sessionContentSchema,
+      expectedExecution: { type: 'string', description: 'Opaque status.executionId required for strict steer of the current execution.' },
+      delivery: { type: 'string', enum: ['message', 'queue', 'context', 'steer'], description: DELIVERY_DESCRIPTION },
+      authorizationRequest: { type: 'object', additionalProperties: false, properties: {
+        participants: { type: 'array', items: { type: 'string' }, required: true, description: 'Complete exact member IDs including your own current sessionId and every target. Use native runtime identity, not team role names; extra members require work extent.' },
+        purpose: { type: 'string', required: true }, extent: { type: 'string', enum: ['message', 'work'], required: true },
+        reply: { type: 'string', enum: ['none', 'once'] },
+        controls: controlAuthorizationSchema,
+      }, description: 'Ask native approval for message or work. message reply=once includes one reply; work permits repeated exchanges without per-round approval. This is a request, never a permission.' },
       intent: { type: 'string', enum: ['information'], description: 'Information sharing only: retain context without waking idle targets, granting a reply or starting a task. Omit for existing task/reply behavior.' },
-      requestId: { type: 'string', description: 'For information sharing: stable 8-120 character request identity, reuse for retries; never change recipients or content under this id.' },
+      requestId: { type: 'string', description: 'Stable 8-120 character request identity. Retry the original complete recipient list/content/mode; only known unsubmitted failures are retried, accepted/unknown retain original receipts.' },
       retryFailed: { type: 'boolean', description: 'For a known information batch: retry its unsuccessful recipients with the original requestId and complete original recipient set. Unknown outcomes are inspected rather than resent.' },
-      requireRunning: { type: 'boolean', description: 'Information from a running-only recipient snapshot: skip a recipient if it is no longer running at submission. Does not wake idle sessions.' },
+      requireRunning: { type: 'boolean', description: 'For a running-only snapshot, skip a target that is no longer running at final submission; do not add future running chats. Use disjoint requests for explicit named recipients versus running-only additions.' },
       sessionId: { type: 'string', description: 'One target id; mutually exclusive with sessionIds. For a reply, use the original sender.' },
       sessionIds: { type: 'array', items: { type: 'string' }, description: 'Information-only fan-out to a complete explicit recipient snapshot. Use find pagination first; exclude yourself. Requires intent=information. Each result has its own status; a failure never replays successful targets.' },
-      message: { type: 'string', required: true, description: 'Message text to send as a user turn.' },
+      message: { type: 'string', description: 'Message text to send as a user turn.' },
       mode: { type: 'string', enum: ['queue', 'steer'], description: 'steer (default): next step boundary, running target is not aborted, idle target starts a turn. queue: append a whole turn after the current one finishes.' },
       replyHandling: { type: 'string', enum: ['continue', 'receive-only'], description: 'For a NEW task: continue (default) wakes the originator on reply. receive-only retains the reply as context without waking an idle originator; a running originator may use it at its next step. On a reply, omit this field: the original request owns this choice. This grants no extra permission.' },
       waitForReply: { type: 'boolean', description: 'For a new task, wait for its correlated reply (default false). Ignored on terminal replies.' },
@@ -243,6 +283,7 @@ function registerSend(env: BridgeEnv): void {
       schema: { type: 'object', additionalProperties: true },
       render: (args, value) => {
         const v = value as Record<string, unknown>
+        if (v.protocolVersion === 2) return [{ type: 'text' as const, text: JSON.stringify(v) }]
         if (Array.isArray(v.results)) return [{ type: 'text' as const, text: 'information batch ' + String(v.requestId) + '\n' + (v.results as Array<Record<string, unknown>>).map(item => String(item.sessionId) + ': ' + String(item.status) + (item.error ? ' — ' + String(item.error) : '')).join('\n') }]
         const reply = v.reply as Record<string, unknown> | null | undefined
         const terminal = v.terminal === true
@@ -264,6 +305,9 @@ function registerSend(env: BridgeEnv): void {
     },
     async execute(args: SendArgs, exec) {
       args = structuredClone(args)
+      if (args.targets !== undefined || args.content !== undefined || args.authorizationRequest !== undefined || args.delivery !== undefined || args.context !== undefined || args.expectedExecution !== undefined) {
+        return asJson(await sendRequest(args, exec))
+      }
       const timeout = clampTimeout(args.timeoutMs)
       if (typeof args.message !== 'string' || args.message.trim() === '') throw new Error('invalid message: expected a non-empty string')
       if (args.intent === 'information' && (args.waitForReply === true || args.replyTo !== undefined || args.replyHandling === 'continue')) throw new Error('information cannot request a reply or continuation')
@@ -292,7 +336,7 @@ function registerSend(env: BridgeEnv): void {
         const pendingTargets = targets.filter(id => !preserved.some(item => item.sessionId === id))
         const checkpoint = env.delivery!.authorizationCheckpoint(caller.id)
         const run = Promise.resolve().then(async () => {
-          exec.signal?.throwIfAborted()
+          throwIfCollaborationAborted(exec.signal)
           const allGranted = pendingTargets.every(id => env.grants.isGranted(caller.id, id))
           if (!allGranted) await approveOnce(env, exec, 'session_coordinator_send', { intent: 'information', sessionIds: pendingTargets, message: args.message, mode: args.mode ?? 'steer', requestId })
           checkpoint()
@@ -301,7 +345,7 @@ function registerSend(env: BridgeEnv): void {
             const accepted = preserved.find(item => item.sessionId === sessionId)
             if (accepted !== undefined) { results.push(accepted); continue }
             try {
-              exec.signal?.throwIfAborted(); checkpoint()
+              throwIfCollaborationAborted(exec.signal); checkpoint()
               if (allGranted && !env.grants.isGranted(caller.id, sessionId)) throw new Error('coordination authorization changed before delivery')
               const sent = await env.delivery!.send({ sessionId, message: args.message, mode: args.mode, intent: 'information', requestId, requireRunning: args.requireRunning }, caller, undefined,
                 { signal: exec.signal, informationRecipients: targets, authorize: async () => { checkpoint() } })
@@ -320,19 +364,19 @@ function registerSend(env: BridgeEnv): void {
       if (args.requireRunning !== undefined && args.intent !== 'information') throw new Error('requireRunning requires information intent')
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
       const sent = await env.delivery!.send({ ...args, sessionId: args.sessionId }, caller, undefined, { signal: exec.signal, authorize: () => approveOnce(env, exec, 'session_coordinator_send', args) })
-      if (sent.terminal && caller !== undefined && !exec.signal.aborted && env.delivery!.canConclude(caller, sent.messageId)) exec.concludeTurn?.()
+      if (sent.terminal && caller !== undefined && !exec.signal.aborted && env.delivery!.canConclude(caller, sent.messageId, exec)) exec.concludeTurn?.()
       const reply = args.waitForReply === true && !sent.terminal
         ? await env.delivery!.waitForRequest(caller!.id, sent.sessionId, sent.messageId, timeout, exec.signal)
         : undefined
       return asJson({ ...sent, ...(reply === undefined ? {} : { reply }) })
     },
-  })))
+  })), ['sessionId', 'sessionIds', 'message', 'intent', 'mode', 'waitForReply', 'retryFailed', 'timeoutMs'])
 }
 
 function registerResume(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_coordinator_resume',
-    description: 'Legacy standalone session management: load one persisted chat for session-level monitoring or an explicitly requested whole-chat reopen. Requires a target-specific /coordinate grant; a collaboration approval is not that grant. For a paused/interrupted collaboration, use session_coordinator_collaboration_control(action=resume) for the scope/task, then session_coordinator_collaboration_send for remaining work; that send loads an offline member automatically. Do not call this as a prerequisite to collaboration work or read-only history: session_coordinator_read reads persisted history without reopening. If already live this is a no-op. Provider/model default to the target session previous config.',
+    description: 'Load one persisted independent chat for explicitly requested whole-chat reopen or monitoring. Requires a target-specific /coordinate grant. Read-only history uses session_coordinator_read without reopening. Recover an optional task with session_coordinator_control object=task and its stable taskId; ordinary communication uses session_coordinator_send. Provider/model default to the target previous config.',
     parameters: {
       sessionId: { type: 'string', required: true, description: 'Session id to resume (persisted log must exist).' },
       provider: { type: 'string', description: 'Optional provider override.' },
@@ -356,6 +400,9 @@ function registerResume(env: BridgeEnv): void {
 }
 
 interface WaitArgsTool {
+  taskHandles?: string[]
+  targets?: SessionWaitTarget[]
+  mode?: 'any' | 'all'
   requestId?: string
   sessionId: string
   sinceSeq?: number
@@ -365,12 +412,15 @@ interface WaitArgsTool {
 }
 
 function registerWait(env: BridgeEnv): void {
-  env.ctx.tools.register(defineTool({
+  registerCurrentSessionTool(env, defineTool({
     name: 'session_coordinator_wait',
-    description: 'With requestId from send, wait for the committed reply to that outgoing task owned by the calling session; this does not require a live target or assistant text and never falls back to old answers. After reload, only a complete owned two-sided delivery/reply record can return a read-only recovered result; missing/conflicting evidence fails explicitly without resuming or resending. Without requestId, wait for a session next assistant output: blocks (polling the session log) until a NEW assistant output appears after sinceSeq (default: the latest seq at call time). waitFor=reply returns as soon as a new assistant TEXT reply is readable; waitFor=segment returns as soon as any new COMPLETED output segment appears (an assistant/message step — text, reasoning, or tool-call turn), i.e. it does NOT wait for the whole turn, so you can observe the chain-of-thought/output paragraph by paragraph as it is produced. If no new output arrives within the budget, the latest PRE-EXISTING reply/segment is returned with stale=true (so an already-landed reply is never lost as "(no text)"). Returns the output summary, or timedOut/aborted when the deadline or caller cancellation ends the wait. Use it to consume output produced asynchronously by another session (e.g. a session you sent a message to, or one working on its own); to read a reply that may already exist, pass the sinceSeq anchor returned by send/create.',
+    description: 'Wait for another chat using targets: copy each accepted send result.waitTarget or create initialMessage.waitTarget unchanged. It contains the required sessionId, afterCursor and exact replyTo; never pass only a messageId/cursor. Reuse returned cursors unchanged for later waits: they preserve replyTo. mode=any/all observes new messages or execution facts, not business success. status.waitTarget observes general activity, so use a send waitTarget when awaiting its business reply. pendingInput=true yields to this chat’s new next-step input, not the selected reply; next-turn input stays queued. Cancellation stops only the wait, never the work. Use this instead of shell polling or repeated receipt queries. Optional taskHandles waits only on already declared versioned tasks, without targets; terminal done does not mean allSucceeded and old revisions fail.',
     parameters: {
+      taskHandles: {type:'array',items:{type:'string'},description:'Optional version-bound task references. Cannot mix with session targets or legacy parameters. any/all readiness preserves each task state; done is not business success. Cancelling this wait does not cancel tasks or jobs.'},
+      targets: { type: 'array', items: { type: 'object', properties: { sessionId: { type: 'string', required: true, description: 'Exact target chat identity; copy from waitTarget.' }, afterCursor: { type: 'string', required: true, description: 'Opaque cursor for this same chat; copy from waitTarget or returned cursors.' }, replyTo: { type: 'string', description: 'Exact outgoing message whose reply is needed; preserved by waitTarget and returned cursors.' } }, additionalProperties: false }, description: 'Copy complete waitTarget objects from accepted send results/create first-message receipts, or cursors returned by a prior wait. Ordinary communication needs no task declaration.' },
+      mode: { type: 'string', enum: ['any', 'all'], description: 'Return on any or all target updates; errors remain per target.' },
       requestId: { type: 'string', description: 'Task messageId returned by send. Selects correlated reply waiting; cannot combine with sinceSeq, waitFor or requireTurnEnd.' },
-      sessionId: { type: 'string', required: true, description: 'Session id to wait on.' },
+      sessionId: { type: 'string', description: 'Legacy single session waiting.' },
       sinceSeq: { type: 'number', description: 'Only replies after this event seq count (default: latest seq at call time; -1 = count every event, the anchor returned by create for a brand-new session).' },
       timeoutMs: { type: 'number', description: 'Wait budget in milliseconds (default 180000, max 3600000); timed out waits return the partial result instead of failing.' },
       requireTurnEnd: { type: 'boolean', description: 'When true, wait for the reply turn/end to settle before returning (default false; false returns as soon as the reply text is readable).' },
@@ -380,6 +430,8 @@ function registerWait(env: BridgeEnv): void {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => {
         const v = value as Record<string, unknown>
+        if (Array.isArray(v.tasks)) return [{type:'text' as const,text:JSON.stringify(v)}]
+        if (Array.isArray(v.updates)) return [{ type: 'text' as const, text: JSON.stringify(v) }]
         const reply = v.reply as Record<string, unknown> | null | undefined
         if (reply === null || reply === undefined) return [{ type: 'text' as const, text: 'no reply observed' }]
         if (reply.kind === 'request-reply') return [{ type: 'text' as const, text: [reply.received === true ? String((reply.message as Record<string, unknown>).text) : 'no correlated reply received', ...waitNotes(reply)].join('\n') }]
@@ -393,6 +445,18 @@ function registerWait(env: BridgeEnv): void {
       },
     },
     async execute(args: WaitArgsTool, exec) {
+      if(args.taskHandles!==undefined){
+        if(['targets','sessionId','requestId','sinceSeq','requireTurnEnd','waitFor'].some(key=>args[key as keyof WaitArgsTool]!==undefined))throw new Error('taskHandles and session wait parameters are mutually exclusive; do not mix')
+        return asJson(await (await env.collaboration!).waitSessionTasks(args.taskHandles,args.mode??'any',args.timeoutMs,exec))
+      }
+      if (args.mode !== undefined && args.targets === undefined) throw new Error('mode requires cursor wait targets')
+      if (args.targets !== undefined) {
+        const targets = structuredClone(args.targets)
+        if (!Array.isArray(targets) || targets.length === 0 || targets.length > 32 || targets.some(target => !target || typeof target.sessionId !== 'string' || !target.sessionId.trim() || typeof target.afterCursor !== 'string' || !target.afterCursor.trim() || target.replyTo !== undefined && (typeof target.replyTo !== 'string' || !target.replyTo.trim())) || new Set(targets.map(target => target.sessionId)).size !== targets.length) throw new Error('wait targets require sessionId, afterCursor and optional nonempty replyTo, with up to 32 unique exact target identities')
+        if (args.sessionId !== undefined || args.requestId !== undefined || args.sinceSeq !== undefined || args.waitFor !== undefined || args.requireTurnEnd !== undefined) throw new Error('do not mix cursor and legacy wait arguments')
+        if (args.mode !== undefined && args.mode !== 'any' && args.mode !== 'all') throw new Error('invalid wait mode')
+        return asJson(await waitSessions(env.ctx, (exec.agent as LiveAgentLike | undefined)?.id ?? '', targets, args.mode ?? 'any', clampTimeout(args.timeoutMs), exec.signal))
+      }
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
       if (args.requestId !== undefined) {
         if (typeof args.requestId !== 'string' || args.requestId.trim() === '') throw new Error('invalid requestId')
@@ -427,13 +491,23 @@ function registerWait(env: BridgeEnv): void {
         running: agent.status === 'running',
       })
     },
-  }))
+  }), ['sessionId', 'requestId', 'sinceSeq', 'requireTurnEnd', 'waitFor'])
 }
 
 interface SegmentsArgs {
   sessionId: string
   sinceSeq?: number
   limit?: number
+}
+async function readSegments(env: BridgeEnv, args: SegmentsArgs) {
+  if (typeof args.sessionId !== 'string' || !args.sessionId.trim()) throw new Error('invalid sessionId: expected a non-empty string')
+  const agent = liveAgent(env, args.sessionId)
+  const events = agent ? sessionEvents(agent.session) : (await inspectPersistedSession(env.ctx, args.sessionId)).events
+  const sinceSeq = typeof args.sinceSeq === 'number' && Number.isInteger(args.sinceSeq) && args.sinceSeq >= 0 ? args.sinceSeq : 0
+  const limit = clampLimit(args.limit, 10, 50), all = segmentsSince(events, sinceSeq), page = all.slice(0, limit)
+  env.registry.touch(args.sessionId)
+  return { sessionId: args.sessionId, live: !!agent, truncated: all.length > limit, nextCursorSeq: page.at(-1)?.seq ?? sinceSeq,
+    segments: page.map(sg => ({seq:sg.seq,time:sg.time,turn:sg.turn,step:sg.step,openTurn:sg.openTurn,...(sg.text === undefined ? {} : {text:sg.text}),...(sg.reasoning === undefined ? {} : {reasoning:sg.reasoning}),...(sg.toolCalls.length ? {toolCalls:sg.toolCalls} : {})})) }
 }
 function registerSegments(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
@@ -461,46 +535,14 @@ function registerSegments(env: BridgeEnv): void {
       },
     },
     async execute(args: SegmentsArgs) {
-      const agent = liveAgent(env, args.sessionId)
-      let events: readonly SessionEvent[]
-      let live: boolean
-      if (agent !== undefined) {
-        events = sessionEvents(agent.session)
-        live = true
-      } else {
-        try {
-          const inspection = await inspectPersistedSession(env.ctx, args.sessionId)
-          events = inspection.events
-          live = false
-        } catch (error) {
-          throw new Error(String(error))
-        }
-      }
-      const sinceSeq = typeof args.sinceSeq === 'number' && Number.isInteger(args.sinceSeq) && args.sinceSeq >= 0 ? args.sinceSeq : 0
-      const limit = clampLimit(args.limit, 10, 50)
-      const segs = segmentsSince(events, sinceSeq)
-      env.registry.touch(args.sessionId)
-      const nextCursorSeq = segs.length === 0 ? sinceSeq : (segs[segs.length - 1]?.seq ?? sinceSeq)
-      return asJson({
-        sessionId: args.sessionId,
-        live,
-        nextCursorSeq,
-        segments: segs.map((sg) => ({
-          seq: sg.seq,
-          time: sg.time,
-          turn: sg.turn,
-          step: sg.step,
-          openTurn: sg.openTurn,
-          ...(sg.text === undefined ? {} : { text: sg.text }),
-          ...(sg.reasoning === undefined ? {} : { reasoning: sg.reasoning }),
-          ...(sg.toolCalls.length > 0 ? { toolCalls: sg.toolCalls } : {}),
-        })),
-      })
+      return asJson(await readSegments(env, args))
     },
   }))
 }
 
 interface ReadArgs {
+  view?: 'messages' | 'segments'
+  cursor?: string
   sessionId: string
   sinceSeq?: number
   limit?: number
@@ -511,29 +553,26 @@ interface ReadArgs {
 function registerRead(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_coordinator_read',
-    description: 'Read messages from any session — live or persisted (offline) — folding its event log into user/assistant text rows. By default returns the latest 20 messages; use limit for more (max 100) and sinceSeq to page forward from an event seq. role filters user/assistant rows; includeReasoning=false drops reasoning blocks.',
+    description: 'Read messages from any live or offline chat without waking it or exposing reasoning. Default view=messages pages user/assistant rows (default 20, max 100); follow nextCursor with the same chat and role. view=segments reads completed assistant outputs incrementally (default 10, max 50); use sinceSeq=nextCursorSeq for the next page, without cursor or role. Neither view waits for execution or proves business completion.',
     parameters: {
+      view: { type: 'string', enum: ['messages', 'segments'], description: 'messages (default) for conversation history; segments for completed assistant outputs using numeric sinceSeq/nextCursorSeq.' },
       sessionId: { type: 'string', required: true, description: 'Session id to read (any session, even offline).' },
       sinceSeq: { type: 'number', description: 'Only return messages with seq greater than this value (paging).' },
       limit: { type: 'number', description: 'Number of most recent messages to return (default 20, max 100).' },
       role: { type: 'string', enum: ['user', 'assistant', 'both'], description: 'role filter (default both).' },
-      includeReasoning: { type: 'boolean', description: 'Include assistant reasoning blocks (default true).' },
+      includeReasoning: { type: 'boolean', description: 'Legacy argument; reasoning is not exposed by this read interface.' },
+      cursor: { type: 'string', description: 'nextCursor from this chat and the same role filter; mutually exclusive with legacy sinceSeq.' },
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => {
-        const v = value as Record<string, unknown>
-        const messages = (v.messages as Array<Record<string, unknown>> | null) ?? []
-        if (messages.length === 0) return [{ type: 'text' as const, text: '(no messages)' }]
-        const lines = messages.map((m) => {
-          const head = m.role === 'user' ? 'user' : 'assistant'
-          const text = typeof m.text === 'string' ? m.text : '(no text)'
-          return head + ' #' + String(m.seq) + ': ' + text
-        })
-        return [{ type: 'text' as const, text: lines.join('\n') }]
-      },
+      render: (_args, value) => [{ type: 'text' as const, text: JSON.stringify(value) }],
     },
     async execute(args: ReadArgs) {
+      if (args.view === 'segments') {
+        if (args.cursor !== undefined || args.role !== undefined || args.includeReasoning !== undefined) throw new Error('segments uses sinceSeq/nextCursorSeq, not message cursor, role or reasoning options')
+        const result = await readSegments(env, args)
+        return asJson({...result,segments:result.segments.map(({reasoning,...segment})=>segment)})
+      }
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
       const agent = liveAgent(env, args.sessionId)
       let events: readonly SessionEvent[]
@@ -557,11 +596,22 @@ function registerRead(env: BridgeEnv): void {
       let rows = foldMessages(events)
       if (args.role === 'user') rows = rows.filter((r) => r.role === 'user')
       if (args.role === 'assistant') rows = rows.filter((r) => r.role === 'assistant')
-      if (args.includeReasoning === false) rows = rows.map((r) => ({ ...r, reasoning: undefined }))
-      const sinceSeq = typeof args.sinceSeq === 'number' && Number.isInteger(args.sinceSeq) && args.sinceSeq >= 0 ? args.sinceSeq : undefined
-      if (sinceSeq !== undefined) rows = rows.filter((r) => r.seq > sinceSeq)
+      rows = rows.map((r) => ({ ...r, reasoning: undefined }))
+      let sinceSeq = typeof args.sinceSeq === 'number' && Number.isInteger(args.sinceSeq) && args.sinceSeq >= 0 ? args.sinceSeq : -1
+      if (args.cursor !== undefined) {
+        if (args.sinceSeq !== undefined) throw new Error('cursor cannot be combined with sinceSeq')
+        let cursor: unknown
+        try { cursor = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf8')) } catch { throw new Error('invalid read cursor') }
+        if (!Array.isArray(cursor) || cursor.length !== 4 || cursor[0] !== 1 || cursor[1] !== args.sessionId || cursor[2] !== (args.role ?? 'both') || !Number.isSafeInteger(cursor[3]) || cursor[3] < -1) throw new Error('invalid read cursor for this chat/filter')
+        sinceSeq = cursor[3]
+      }
+      rows = rows.filter((r) => r.seq > sinceSeq)
       const limit = clampLimit(args.limit, 20, 100)
-      rows = rows.slice(-limit)
+      const truncated = rows.length > limit
+      rows = rows.slice(0, limit)
+      const cursorSeq = rows.at(-1)?.seq ?? sinceSeq
+      const nextCursor = Buffer.from(JSON.stringify([1, args.sessionId, args.role ?? 'both', cursorSeq])).toString('base64url')
+      const eventBySeq = new Map<number, SessionEvent>(events.map(event => [event.seq, event]))
       const workspaceId = workspaceByPath(env.ctx, cwd)
       env.registry.touch(args.sessionId, {
         ...(cwd === undefined ? {} : { cwd }),
@@ -573,7 +623,11 @@ function registerRead(env: BridgeEnv): void {
         ...(cwd === undefined ? {} : { cwd }),
         ...(workspaceId === undefined ? {} : { workspaceId }),
         title: titleOf(events) ?? null,
+        nextCursor, truncated,
         messages: rows.map((r) => ({
+          messageId: (eventBySeq.get(r.seq)?.data as { id?: string }).id ?? args.sessionId + ':' + r.seq,
+          source: (eventBySeq.get(r.seq)?.data as { source?: unknown }).source ?? { kind: r.role },
+          content: r.text === undefined ? [] : [{ type: 'text', text: r.text }],
           seq: r.seq,
           time: r.time,
           role: r.role,
@@ -590,6 +644,7 @@ function registerRead(env: BridgeEnv): void {
 }
 
 interface FindArgs {
+  state?: 'running' | 'idle' | 'offline' | 'all'
   query?: string
   sessionId?: string
   title?: string
@@ -615,6 +670,7 @@ function registerFind(env: BridgeEnv): void {
       workspaceId: { type: 'string', description: 'Only sessions in this workspace id.' },
       cwd: { type: 'string', description: 'Only sessions whose cwd contains this substring (path or basename).' },
       liveOnly: { type: 'boolean', description: 'When true, only live sessions are returned (default false).' },
+      state: { type: 'string', enum: ['running', 'idle', 'offline', 'all'], description: 'Actual native running/loaded state; offline is persisted without a live agent. Combine with archived=false, mainOnly=true for ordinary recipients.' },
       running: { type: 'boolean', description: 'Filter actual running state, not just live/loaded. False includes idle and offline sessions.' },
       archived: { type: 'boolean', description: 'False: only nonarchived; true: only archived. Omitted preserves legacy inclusion of both.' },
       mainOnly: { type: 'boolean', description: 'Exclude child/subagent sessions from ordinary chat recipient sets.' },
@@ -644,7 +700,7 @@ function registerFind(env: BridgeEnv): void {
     },
     async execute(args: FindArgs, exec) {
       const limit = clampLimit(args.limit, 10, 50)
-      exec.signal?.throwIfAborted()
+      throwIfCollaborationAborted(exec.signal)
       if (args.excludeSessionIds !== undefined && (!Array.isArray(args.excludeSessionIds) || args.excludeSessionIds.some(id => typeof id !== 'string' || id.trim() === ''))) throw new Error('invalid excludeSessionIds')
       for (const key of ['running', 'archived', 'mainOnly', 'liveOnly'] as const) if (args[key] !== undefined && typeof args[key] !== 'boolean') throw new Error('invalid ' + key)
       let offset = 0, expectedFingerprint: string | undefined
@@ -722,7 +778,7 @@ function registerFind(env: BridgeEnv): void {
       const needsOfflineTitle = titleFilter !== '' || (query !== '' && items.some((item) => !item.live))
       if (needsOfflineTitle) {
         for (const item of items) {
-          exec.signal?.throwIfAborted()
+          throwIfCollaborationAborted(exec.signal)
           if (item.live || item.title !== undefined) continue
           try {
             const inspection = await inspectPersistedSession(env.ctx, item.sessionId)
@@ -734,6 +790,7 @@ function registerFind(env: BridgeEnv): void {
       }
       const filtered = items.filter((item) => {
         if (excluded.has(item.sessionId)) return false
+        if (args.state && args.state !== 'all' && args.state !== (item.live ? item.running ? 'running' : 'idle' : 'offline')) return false
         if (args.mainOnly === true && item.origin === 'subagent') return false
         if (args.running !== undefined && (item.running === true) !== args.running) return false
         if (args.archived !== undefined && (!archiveKnown || archived.has(item.sessionId) !== args.archived)) return false
@@ -754,18 +811,17 @@ function registerFind(env: BridgeEnv): void {
         if (a.live !== b.live) return a.live ? -1 : 1
         return (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.sessionId.localeCompare(b.sessionId)
       })
-      exec.signal?.throwIfAborted()
-      const filters = [query, idFilter, titleFilter, wsFilter, cwdFilter, args.liveOnly === true, args.running ?? null, args.archived ?? null, args.mainOnly === true, [...excluded].sort()]
+      throwIfCollaborationAborted(exec.signal)
+      const filters = [args.state ?? null, query, idFilter, titleFilter, wsFilter, cwdFilter, args.liveOnly === true, args.running ?? null, args.archived ?? null, args.mainOnly === true, [...excluded].sort()]
       const fingerprint = createHash('sha256').update(JSON.stringify([filters, issues, filtered.map(item => [item.sessionId, item.title, item.live, item.running, archived.has(item.sessionId)])])).digest('hex')
       if (expectedFingerprint !== undefined && expectedFingerprint !== fingerprint) throw new Error('discovery set changed; restart without cursor before dispatch')
       const nextOffset = offset + limit
       const caller = exec.agent as LiveAgentLike | undefined
       const input = caller && liveAgent(env, caller.id) === caller ? sessionEvents(caller.session).findLast(event => event.type === 'user/message' && event.data.source?.kind === 'user') : undefined
       const nativeReferences = input?.type === 'user/message' ? readNativeSessionReferences(caller!.session, input.data.id) : []
-      return asJson({
-        nativeReferences,
-        items: filtered.slice(offset, nextOffset).map((item) => ({
+      const sessions = filtered.slice(offset, nextOffset).map((item) => ({
           sessionId: item.sessionId,
+          state: item.live ? item.running ? 'running' : 'idle' : 'offline',
           ...(item.title === undefined ? {} : { title: item.title }),
           ...(item.cwd === undefined ? {} : { cwd: item.cwd }),
           ...(item.workspaceId === undefined ? {} : { workspaceId: item.workspaceId }),
@@ -777,7 +833,10 @@ function registerFind(env: BridgeEnv): void {
           ...(item.createdAt === undefined ? {} : { createdAt: item.createdAt }),
           ...(item.updatedAt === undefined ? {} : { updatedAt: item.updatedAt }),
           ...(item.agentPreset === undefined ? {} : { agentPreset: item.agentPreset }),
-        })),
+        }))
+      return asJson({
+        nativeReferences,
+        sessions, items: sessions,
         total: filtered.length,
         truncated: nextOffset < filtered.length,
         complete: issues.length === 0,
@@ -807,12 +866,12 @@ const BRIDGE_TOOL_REGISTRARS: ReadonlyArray<(env: BridgeEnv) => void> = [
   registerRead,
   registerFind,
   registerStatus,
-  registerCancel,
+  registerSessionControl,
   registerMonitor,
   registerArchive,
   // 只读回执查询（#5）走 ctx 而不是 env：它是自包含模块，不碰 registry / monitor。
   (env) => registerReceipt(env.ctx),
-  (env) => { registerCollaborationMaterialTools(env, installCollaboration(env)) },
+  (env) => { registerCollaborationMaterialTools(env, env.collaboration ??= installCollaboration(env)) },
 ]
 
 /** 注册全部工具（顺序即 {@link BRIDGE_TOOL_REGISTRARS} 的顺序）。 */
@@ -820,6 +879,7 @@ export function registerBridgeTools(env: BridgeEnv): void {
   observeDiagnostics(env.ctx)
   env.delivery ??= new SessionDelivery(env.ctx, env.registry, env.grants)
   for (const register of BRIDGE_TOOL_REGISTRARS) register(env)
+  env.toolSurface?.refresh()
 }
 
 interface MonitorStartArgs {
@@ -1016,7 +1076,10 @@ function registerMonitor(env: BridgeEnv): void {
 type StatusReasoning = 'none' | 'last' | 'live' | 'tail'
 
 interface StatusArgs {
-  sessionId: string
+  taskHandle?: string
+  taskId?: string
+  sessionId?: string
+  messageId?: string
   stalledMsThreshold?: number
   recent?: number
   reasoning?: StatusReasoning
@@ -1065,9 +1128,12 @@ function renderStatus(snapshot: BridgeStatusSnapshot, stalledMsThreshold: number
 function registerStatus(env: BridgeEnv): void {
   env.ctx.tools.register(defineTool({
     name: 'session_coordinator_status',
-    description: 'Inspect a session\'s live progress for monitoring/scheduling. Returns running/idle, whether a turn is open, last turn number, time since the last event (for stall detection), pending queued work, and the latest text reply. It also surfaces the session\'s chain-of-thought: lastReasoning is the most recent finalized reasoning block, liveReasoning is the in-flight reasoning streamed for the current handled turn (reasoning-delta), and reasoningTail is a compact merged preview. reasoning=none drops all three to keep tokens small. When stalledMsThreshold is given, marks a RUNNING session as stalled once the time since the last event exceeds it (idle sessions are never flagged — a quiet finished session is not stuck). Live chat execution only. For persistent collaboration task progress or restart recovery use session_coordinator_collaboration_status, which also covers offline members; use session_coordinator_read for offline history. Neither requires standalone resume. Use this live snapshot for authorized whole-session monitoring, not as a prerequisite to collaboration task control or dispatch.',
+    description: 'Inspect a live chat with sessionId; add messageId for the historical receipt of one message, live or offline, without waking it. A historical accepted receipt only proves a past Inbox insertion; acknowledged is chronological request evidence, not exact model inclusion or business success. Use wait for business replies instead of repeated status polling. Optional taskHandle/taskId selects task state or stored facts; these never restore permission. Explicit task recovery uses control object=task, action=resume, taskId and expectedRevision with a new native approval. Old jobs remain historical, not proof of current control or stopped work. Idle is not business completion; offline chat history uses read.',
     parameters: {
-      sessionId: { type: 'string', required: true, description: 'Session id to inspect (must be live).' },
+      taskHandle: {type:'string'},
+      taskId: {type:'string',description:'Stable task identity for read-only facts after restart. Does not restore permission or issue a task handle.'},
+      sessionId: { type: 'string', description: 'Exact chat identity. Snapshot requires a live chat; adding messageId also supports offline historical receipts.' },
+      messageId: { type: 'string', description: 'With sessionId only: read historical message receipt evidence, including offline chats. Never grants permission or proves a message is still pending.' },
       stalledMsThreshold: { type: 'number', description: 'Mark a RUNNING session STALLED when time since the last event exceeds this many ms (default 60000); idle sessions are never marked.' },
       recent: { type: 'number', description: 'Number of recent messages to include in the snapshot (default 8, max 20).' },
       reasoning: { type: 'string', enum: ['none', 'last', 'live', 'tail'], description: 'Which chain-of-thought fields to include: tail (default) returns lastReasoning/liveReasoning/reasoningTail; last only the finalized reasoning; live only the in-flight reasoning; none drops all reasoning fields.' },
@@ -1075,18 +1141,28 @@ function registerStatus(env: BridgeEnv): void {
     output: {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => {
+        if ((value as Record<string,unknown>).messageId) return [{type:'text' as const,text:JSON.stringify(value)}]
+        if ((value as Record<string,unknown>).taskHandle || 'recoveryRequired' in (value as Record<string,unknown>)) return [{type:'text' as const,text:JSON.stringify(value)}]
         const v = value as Record<string, unknown>
         const snapshot = v.snapshot as BridgeStatusSnapshot | null
         if (snapshot === null || snapshot === undefined) return [{ type: 'text' as const, text: 'session unavailable' }]
         const threshold = typeof v.stalledMsThreshold === 'number' ? v.stalledMsThreshold : 60000
-        return [{ type: 'text' as const, text: renderStatus(snapshot, threshold).join('\n') }]
+        return [{ type: 'text' as const, text: JSON.stringify({ ...v, summary: renderStatus(snapshot, threshold).join('\n') }) }]
       },
     },
-    async execute(args: StatusArgs) {
+    async execute(args: StatusArgs, exec) {
+      if (args.messageId !== undefined) {
+        if (!args.sessionId || args.taskId !== undefined || args.taskHandle !== undefined || args.stalledMsThreshold !== undefined || args.recent !== undefined || args.reasoning !== undefined) throw new Error('messageId requires only sessionId, not task or live-snapshot options')
+        return asJson({ ...await readMessageReceipt(env.ctx, {sessionId:args.sessionId,messageId:args.messageId}), live:!!liveAgent(env,args.sessionId), historical:true })
+      }
+      if ([args.taskId,args.taskHandle,args.sessionId].filter(value=>value!==undefined).length!==1) throw new Error('status requires exactly one sessionId, taskHandle or taskId')
+      if (args.taskId) return asJson(await (await env.collaboration!).sessionTaskFacts(args.taskId,exec))
+      if (args.taskHandle) return asJson(await (await env.collaboration!).sessionTaskStatus(args.taskHandle,exec))
+      if (!args.sessionId) throw new Error('status requires sessionId or taskHandle')
       if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
       const agent = liveAgent(env, args.sessionId)
       if (agent === undefined) {
-        throw new Error('session ' + JSON.stringify(args.sessionId) + ' is not live. Use session_coordinator_collaboration_status for persistent task/scope state or session_coordinator_read for persisted history; neither requires reopening. Collaboration work loads the member through collaboration_send after approved scope/task resume. Standalone session monitoring requires its separate target grant and session_coordinator_resume')
+        throw new Error('session ' + JSON.stringify(args.sessionId) + ' is not live. Use session_coordinator_status with taskHandle/taskId for optional task state, or session_coordinator_read for persisted history; neither requires reopening. Task recovery uses session_coordinator_control object=task. Standalone session monitoring requires its separate target grant and session_coordinator_resume')
       }
       const threshold = typeof args.stalledMsThreshold === 'number' && Number.isFinite(args.stalledMsThreshold) && args.stalledMsThreshold >= 0 ? args.stalledMsThreshold : 60000
       const reasoningMode: StatusReasoning = args.reasoning === 'none' || args.reasoning === 'last' || args.reasoning === 'live' ? args.reasoning : 'tail'
@@ -1100,59 +1176,16 @@ function registerStatus(env: BridgeEnv): void {
       return asJson({
         sessionId: args.sessionId,
         stalledMsThreshold: threshold,
+        executionId: env.delivery!.state.executionId(agent) ?? null,
+        afterCursor: sessionWaitCursor(agent.id, maxSeq(sessionEvents(agent.session))),
+        waitTarget: sessionWaitTarget(agent.id, maxSeq(sessionEvents(agent.session))),
+        deliveries: env.delivery!.deliverySnapshot(agent),
+        controls: env.delivery!.controlSnapshot(agent),
+        materials: await env.delivery!.materialStatus(agent,exec?.signal),
         snapshot: {
           ...snapshot,
           recent: snapshot.recent.slice(-shown).map((row) => ({ ...row })),
         },
-      })
-    },
-  }))
-}
-
-interface CancelArgs {
-  sessionId: string
-  keepInbox?: boolean
-  cause?: string
-}
-
-function registerCancel(env: BridgeEnv): void {
-  env.ctx.tools.register(defineTool({
-    name: 'session_coordinator_cancel',
-    description: 'Legacy WHOLE-SESSION management: abort the entire active turn of a live chat, including unrelated tasks in that turn; by default also clear all queued work. Requires a target-specific /coordinate grant. Use only when the user explicitly wants to stop that whole chat or for its authorized session-level monitor. To stop, pause or resume a task inside a collaboration, use session_coordinator_collaboration_control with scopeId and taskId instead. To close a collaboration scope use that control without taskId. This tool does not control collaboration task/scope state.',
-    parameters: {
-      sessionId: { type: 'string', required: true, description: 'Session id to cancel (must be live).' },
-      keepInbox: { type: 'boolean', description: 'Preserve queued/steering input instead of clearing it (default false, i.e. clear pending work).' },
-      cause: { type: 'string', description: 'Optional stable reason recorded for the cancellation.' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => {
-        const v = value as Record<string, unknown>
-        return [{ type: 'text' as const, text: 'cancelled ' + String(v.sessionId) + ' (running: ' + String(v.running) + (v.keepInbox === true ? ', inbox kept' : ', inbox cleared') + ')' }]
-      },
-    },
-    async execute(args: CancelArgs, exec) {
-      if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') throw new Error('invalid sessionId: expected a non-empty string')
-      requireCoordination(env.grants, (exec.agent as LiveAgentLike | undefined)?.id ?? '', 'cancel', args.sessionId.trim())
-      const agent = liveAgent(env, args.sessionId)
-      if (agent === undefined) {
-        throw new Error('session ' + JSON.stringify(args.sessionId) + ' is not live — call session_coordinator_resume first (cancel requires a live session)')
-      }
-      const cause = typeof args.cause === 'string' && args.cause.trim() !== ''
-        ? { kind: 'hook', reason: args.cause.trim() }
-        : { kind: 'user' }
-      agent.cancel(cause, { keepInbox: args.keepInbox === true })
-      const snapshot = statusSnapshot(env.ctx, agent)
-      const envCwd = agent.session.header.cwd
-      env.registry.touch(args.sessionId, {
-        ...(envCwd === undefined ? {} : { cwd: envCwd }),
-        ...(workspaceByPath(env.ctx, envCwd) === undefined ? {} : { workspaceId: workspaceByPath(env.ctx, envCwd) }),
-      })
-      return asJson({
-        sessionId: args.sessionId,
-        running: agent.status,
-        keepInbox: args.keepInbox === true,
-        snapshot,
       })
     },
   }))

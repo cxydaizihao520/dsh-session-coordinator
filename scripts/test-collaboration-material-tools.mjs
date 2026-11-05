@@ -25,8 +25,9 @@ test('registered material tools recover task checkpoints and fork once without c
   const ready = installCollaboration(env, { store }); registerCollaborationMaterialTools(env, ready)
   let call = 0
   const run = (name, args, caller = 'A', callId = 'call-' + ++call) => tools.get('session_coordinator_collaboration_' + name).execute(args, { agent: agents.get(caller), signal: new AbortController().signal, callId })
+  const seedLegacy=async(args)=> (await ready).start(args,{agent:agents.get('A'),signal:new AbortController().signal,callId:'historical-start-'+(++call)})
   try {
-    const scope = await run('start', { objective: 'Deliver reviewed work', members: ['B', 'C'] })
+    const scope = await seedLegacy( { objective: 'Deliver reviewed work', members: ['B', 'C'] })
     const task = await run('task', { scopeId: scope.id, objective: 'one task', members: ['B'] })
     const common = { scopeId: scope.id, taskId: task.id }
     const checkpoint = await run('material', { ...common, action: 'checkpoint', sourceSessionId: 'member:2', constraints: ['keep source'], decisions: ['use native'], pending: ['verify'] })
@@ -118,8 +119,9 @@ test(`approved ${boundary.task ? 'task' : 'scope'} ${boundary.action} revokes an
   const ready = installCollaboration({ ctx, delivery, registry: { record() {} } }, { store }); registerCollaborationMaterialTools({ ctx }, ready)
   let call = 0
   const run = (name, args, callId = 'call-' + ++call, caller = 'A') => tools.get('session_coordinator_collaboration_' + name).execute(args, { agent: agents.get(caller), signal: new AbortController().signal, callId })
+  const seedLegacy=async(args)=> (await ready).start(args,{agent:agents.get('A'),signal:new AbortController().signal,callId:'historical-start-'+(++call)})
   try {
-    const scope = await run('start', { objective: 'Stop safely', members: ['B'] })
+    const scope = await seedLegacy( { objective: 'Stop safely', members: ['B'] })
     const task = await run('task', { scopeId: scope.id, objective: 'Isolate work', members: ['B'] })
     const common = { scopeId: scope.id, taskId: task.id }
     let result
@@ -184,8 +186,9 @@ test('registered material revocation blocks real Git merge and cwd publication a
   const env = { ctx, registry: { record() {} } }, ready = installCollaboration(env, { store }); registerCollaborationMaterialTools(env, ready)
   let call = 0
   const run = (name, args) => tools.get('session_coordinator_collaboration_' + name).execute(args, { agent: agents.get('A'), signal: new AbortController().signal, callId: 'call-' + ++call })
+  const seedLegacy=async(args)=> (await ready).start(args,{agent:agents.get('A'),signal:new AbortController().signal,callId:'historical-start-'+(++call)})
   try {
-    const scope = await run('start', { objective: 'Review isolated changes', members: ['B', 'C'] })
+    const scope = await seedLegacy( { objective: 'Review isolated changes', members: ['B', 'C'] })
     const task = await run('task', { scopeId: scope.id, objective: 'Change file', members: ['B'] })
     const common = { scopeId: scope.id, taskId: task.id }
     const environment = await run('material', { ...common, action: 'worktree', sessionId: 'B', path: join(repo, '.agents', 'B') })
@@ -198,7 +201,7 @@ test('registered material revocation blocks real Git merge and cwd publication a
     await assert.rejects(integrate, /revoked/)
     assert.equal(merges, 0); assert.equal(git(repo, 'rev-parse', 'HEAD'), base)
     assert.equal(git(environment.path, 'rev-parse', 'HEAD'), source)
-    assert.equal(Object.values((await run('status', { scopeId: scope.id })).tasks[task.id].materialOperations).at(-1).status, 'unknown')
+    assert.equal(Object.values((await run('status', { scopeId: scope.id })).tasks[task.id].materialOperations).at(-1).status, 'rejected')
     const other = await run('task', { scopeId: scope.id, objective: 'Other isolation', members: ['C'] })
     const cwdEntered = gate('cwd')
     const checkoutPath = join(repo, '.agents', 'C')

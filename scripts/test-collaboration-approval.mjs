@@ -1,3 +1,4 @@
+import {legacyHistory} from './fixtures/legacy-history.mjs'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Session } from '@deepseek-ai/dsh-session'
@@ -39,12 +40,12 @@ function fixture() {
   }
   const env = { ctx, grants: createGrants(), registry: { touch() {}, record() {} } }
   registerBridgeTools(env)
-  make('A'); make('B')
+  make('A'); make('B');legacyHistory(agents.get('A'))
   const execution = (who = 'A') => ({ agent: agents.get(who), callId: 'call-' + ++call, signal: new AbortController().signal })
   return { agents, ctx, env, effects, approvals, records, execution,
     run(name, args, who = 'A') { return tools.get('session_coordinator_' + name).execute(args, execution(who)) },
     setAnswer(fn) { answer = fn },
-    human(who = 'A') { agents.get(who).session.append('user/message', { id: 'human-' + ++call, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'explicit human request' }] }, { surfaceOp: 'append' }) },
+    human(who = 'A') { agents.get(who).session.append('user/message', { id: 'human-' + ++call, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'explicit human request' }] }, { surfaceOp: 'append' });legacyHistory(agents.get(who)) },
     async runtime() { return CollaborationRuntime.open(env, {
       list: () => [...records.values()].map(value => structuredClone(value)), get: id => structuredClone(records.get(id)),
       async create(record) { records.set(record.id, structuredClone(record)); return structuredClone(record) },
@@ -95,8 +96,7 @@ test('native rejected decision survives a fresh live Session instance', async ()
   const h = fixture(); h.human(); h.setAnswer(async () => 'rejected')
   await assert.rejects(h.run('create', { prompt: 'proposal' }), /rejected/)
   const prior = h.agents.get('A').session
-  const restored = Session.create('A', undefined, { version: 4, id: 'A', createdAt: 1, isSeeded: false, delegationDepth: 0, cwd: '/tmp/approval-probe' })
-  for (const event of prior.snapshotEvents()) restored.append(event.type, event.data, event.surfaceOp ? { surfaceOp: event.surfaceOp } : undefined)
+  const restored = Session.create('A', structuredClone(prior.snapshotEvents()), structuredClone(prior.header))
   h.agents.get('A').session = restored; h.setAnswer(async () => 'allowed-once')
   await assert.rejects(h.run('create', { prompt: 'after reload' }), /rejected.*human input/)
   assert.equal(h.approvals.length, 1); assert.equal(h.effects.length, 0)

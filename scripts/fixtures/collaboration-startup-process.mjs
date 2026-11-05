@@ -8,9 +8,11 @@ import { installCollaboration } from '../../src/collaboration-tools.ts'
 const [directory, mode] = process.argv.slice(2)
 process.env.DSH_HOME = directory
 const ctx = new Context(); new Storage(ctx)
-ctx.tools = { register() {} }
+ctx.tools = { register() {return()=>{}} }
+ctx.agents = { list:()=>[],get:()=>undefined }
 const disposers = []
-ctx.effect = setup => { const dispose = setup(); disposers.push(dispose); if (mode === 'dispose') dispose() }
+const nativeEffect=ctx.effect.bind(ctx)
+ctx.effect = setup => { const dispose = nativeEffect(setup); disposers.push(dispose); if (mode === 'dispose') dispose();return dispose }
 if (mode === 'invalid') {
   const store = await openCollaborationStore(ctx)
   await store.create({ id: 'collab-invalid', owner: 'A', revision: 1, data: { invalid: true } })
@@ -18,7 +20,7 @@ if (mode === 'invalid') {
 }
 const ready = installCollaboration({ ctx })
 try {
-  await assert.rejects(ready, mode === 'invalid' ? /invalid persisted collaboration collab-invalid/ : /disposed|abort|closed/i)
+  await assert.rejects(ready, mode === 'invalid' ? /invalid persisted collaboration collab-invalid/ : /disposed|abort|closed|collaboration cancelled/i)
   for (const dispose of disposers) dispose()
   const successor = await openCollaborationStore(ctx)
   await successor.close()

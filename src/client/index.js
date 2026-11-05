@@ -5,14 +5,9 @@
  * 包装，没有 bundler、没有第二个包、没有运行时编译（见 docs/PLAN.md M0/T2.1）。
  * 因此本文件**就是**产物：`package.json` 的 `exports["./client"]` 直接指向它。
  *
- * 四条入口（都不动 DSH 源码，也不用 `@`）：
- *   - `conversation.input.left`    → 输入框左侧工具条按钮（悬浮提示「发送到会话」）
- *   - `conversation.input.overlay` → 输入框上方的发送面板
- *   - `conversation.chat.commandview` → coordinate 人工发送记录与关联回信
- *   - `conversation.chat.node` → 自有 Definition 选择的跨会话消息，不覆盖共享键
- * 两者经插槽的 `inject(sessionId)` 拿到同一个会话级状态对象，所以按钮能开面板。
- *
- * 面板通过宿主现有 commands.execute 调用 /coordinate send；来源与回信权统一由宿主绑定。
+ * 当前入口：会话头部日志导出/协作控制、收信节点、coordinate 历史命令卡片。
+ * 控制按钮通过原生 commands.execute 复用宿主的精确 control 消费者。
+ * 旧发送面板的历史卡片保留，不注册新的发送表单。
  *
  * 约束（都是有意的）：
  *   - 不 require 任何 DSH 客户端包，只用模块表里的 react；
@@ -21,7 +16,7 @@
  */
 window.__ModuleLoader__.load({
   id: 'dsh-session-coordinator',
-  factory: (require) => {
+  factory: function sessionCoordinatorClient(require) {
     const React = require('react')
     const h = React.createElement
 
@@ -297,6 +292,8 @@ window.__ModuleLoader__.load({
       const task = source.hopCount === 1 && source.replyTo === undefined && source.rootMessageId === source.messageId
       const reply = source.hopCount === 2 && nonempty(source.replyTo) && source.rootMessageId === source.replyTo
       if (!task && !reply) return null
+      if (source.protocolVersion === 2) return { source, label: typeof source.senderLabel === 'string' ? source.senderLabel : '', body: data.content[0].text, message: data, event: event.pendingRecord ?? event }
+      if (source.protocolVersion !== undefined) return null
       const message = protocolMessage(data.content[0].text, source)
       return message === null ? null : { source, ...message, message: data, event: event.pendingRecord ?? event }
     }
@@ -435,6 +432,7 @@ window.__ModuleLoader__.load({
       'diagnostics.prepared': '协作诊断已生成；不代表消息送达或任务完成。',
       'diagnostics.export': '导出协作日志',
       'diagnostics.started': '已开始下载',
+      'diagnostics.metadataPartial': '已开始下载；部分运行版本或指纹不可核验，详见文件',
       'diagnostics.partial': '已开始下载；部分日志缺失或截断，详见文件',
       'diagnostics.failed': '导出失败：请确认已加载支持日志的新插件，再重试',
       tooltip: '发送到会话',
@@ -509,6 +507,7 @@ window.__ModuleLoader__.load({
       'diagnostics.prepared': 'Collaboration diagnostics prepared; this does not establish delivery or task completion.',
       'diagnostics.export': 'Export collaboration logs',
       'diagnostics.started': 'Download started',
+      'diagnostics.metadataPartial': 'Download started; some runtime versions or fingerprints are unknown',
       'diagnostics.partial': 'Download started; some logs are missing or truncated',
       'diagnostics.failed': 'Export failed: load the plugin version supporting diagnostics and retry',
       tooltip: 'Send to session',
@@ -911,14 +910,16 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // History icon from dsh-superagent/src/client/controls.tsx (MIT; see LICENSE).
     function DiagnosticsButton(props) {
       const text = translator(props.t)
       const [state, setState] = React.useState({})
       const active = state.sessionId === props.sessionId ? state : {}
       const inFlight = React.useRef(false)
       return h('span', null,
-        h('button', { type: 'button', className: 'dsh-sc-button', style: { width: 'auto', padding: '0 8px', whiteSpace: 'nowrap' }, disabled: active.busy,
-          'aria-label': text('diagnostics.export'), title: text('diagnostics.export'),
+        h('style', null, BUTTON_CSS),
+        h('button', { type: 'button', className: 'dsh-sc-button', disabled: active.busy, style: active.error ? { color: 'var(--dsw-alias-state-warn-primary)' } : undefined,
+          'aria-label': text('diagnostics.export'), title: active.error || active.message || text('diagnostics.export'),
           onClick: async () => {
             if (inFlight.current) return
             inFlight.current = true
@@ -928,12 +929,33 @@ window.__ModuleLoader__.load({
               const data = await props.exportDiagnostics(sessionId)
               props.downloadDiagnostics(data)
               const incomplete = data.sessions.some(row => row.incomplete !== false || row.truncated || row.total === 0) || data.discovery.truncated
-              setState({ sessionId, message: text(incomplete ? 'diagnostics.partial' : 'diagnostics.started') })
+              setState({ sessionId, message: text(incomplete ? 'diagnostics.partial' : data.runtime?.unknownFields?.length ? 'diagnostics.metadataPartial' : 'diagnostics.started') })
             } catch {
               setState({ sessionId, error: text('diagnostics.failed') })
             } finally { inFlight.current = false }
-          } }, h('style', null, BUTTON_CSS), text('diagnostics.export')),
-        active.error ? h('span', { role: 'alert' }, active.error) : active.message ? h('span', { role: 'status' }, active.message) : null)
+          } },
+          h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+            h('path', { d: 'M3.5 12a8.5 8.5 0 1 0 2.5-6M3.5 4v4h4M12 8v4l3 2' }))),
+        active.error || active.message ? h('span', { role: active.error ? 'alert' : 'status', style: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clipPath: 'inset(50%)', whiteSpace: 'nowrap' } }, active.error || active.message) : null)
+    }
+
+    // Fingerprint this running module factory, not a fresh disk fetch or the whole client process.
+    async function runtimeIdentity(ctx, previous) {
+      const runtime = asRecord(previous), client = asRecord(runtime.client), host = asRecord(runtime.host)
+      let fingerprint = null, hostVersion = null
+      try {
+        if (typeof crypto === 'object' && crypto?.subtle && typeof TextEncoder === 'function') {
+          const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(Function.prototype.toString.call(sessionCoordinatorClient)))
+          fingerprint = { algorithm: 'SHA-256', scope: 'loaded-module-factory-source', value: Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('') }
+        }
+      } catch { /* An unavailable runtime capability is reported, never guessed from disk. */ }
+      try {
+        const version = ctx.get?.('productAnalytics')?.config?.appVersion
+        if (typeof version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) hostVersion = version
+      } catch { /* Optional public client service may be absent. */ }
+      const value = { ...runtime, client: { ...client, loadedVersion: '0.2.20', loadedFingerprint: fingerprint }, host: { ...host, version: hostVersion, fingerprint: host.fingerprint ?? null, versionSource: hostVersion ? 'productAnalytics.config.appVersion' : 'unavailable' } }
+      value.unknownFields = ['plugin.version', 'plugin.artifactSha256', 'host.version', 'host.fingerprint', 'client.loadedVersion', 'client.loadedFingerprint'].filter(path => { const [section, key] = path.split('.'); return asRecord(value[section])[key] == null })
+      return value
     }
 
     function downloadDiagnostics(data) {
@@ -1055,7 +1077,7 @@ window.__ModuleLoader__.load({
                 if (execution.ok !== true || result.kind !== 'success') throw new Error('diagnostics unavailable')
                 const data = JSON.parse(result.text)
                 if (data.schemaVersion !== 1 || data.businessContentIncluded !== false || !Array.isArray(data.sessions) || !data.discovery) throw new Error('diagnostics version unavailable')
-                return data
+                return { ...data, runtime: await runtimeIdentity(ctx, data.runtime) }
               },
             } : {
               bridge: bridgeFor(sessionId),

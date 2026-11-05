@@ -107,6 +107,7 @@ function harness(options = {}) {
   }
 
   const ctx = {
+    on(){return()=>{}},
     get: name => name === 'llm' ? llm : undefined,
     tools: { register: (tool) => { registered.set(tool.name, tool) } },
     agents: {

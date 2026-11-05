@@ -13,13 +13,14 @@ function harness(options = {}) {
   const requestHeader = { config: { provider: 'target-provider', model: 'target-model', reasoningEffort: 'target-effort' }, ...(options.requestHeader ?? {}) }
   const events = options.events ?? [{ type: 'request/header', data: { header: requestHeader } }]
   const projections = options.projections ?? { values: { agentPreset: 'target-preset', modelSelection: { lastUsed: requestHeader.config, next: requestHeader.config } } }
-  const agentCtx = { on(name, hook) { hooks.set(name, hook); return () => {} } }
-  const agent = { id: 'B', ctx: agentCtx, session: { header, requestHeader: () => options.resumedHeader ?? requestHeader, snapshotEvents: () => events }, status: 'idle' }
+  let modelState = options.modelState ?? { pending: null }
+  const agentCtx = { get: name => ctx.get(name), on(name, hook) { hooks.set(name, hook); return () => {} } }
+  const agent = { id: 'B', ctx: agentCtx, session: { header, requestHeader: () => options.resumedHeader ?? requestHeader, snapshotEvents: () => events, append(type,data){ events.push({type,data,seq:events.length});if(type==='model/selection') modelState={pending:data} } }, status: 'idle' }
   const ctx = {
     get: name => name === 'sessionQuery' ? { async observeSession(id) { assert.equal(id, 'B'); return { header, events, projections, [Symbol.dispose]() { disposed++ } } } }
       : name === 'llm' ? { async resolveCallConfig(selection) { checks.push(selection); if (options.invalidModel) throw new Error('native unsupported model') } }
       : name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'default-provider', model: 'default-model' }) }
-      : name === 'sessionProjections' ? { stateOf: () => options.modelState ?? { pending: null } }
+      : name === 'sessionProjections' ? { stateOf: () => modelState }
       : name === 'agentPresets' ? ctx.agentPresets : undefined,
     typert: { lookups: { get() { return options.noResolver ? undefined : { async resolve(id) { if (options.resolverError) throw new Error('native policy refused'); if (options.desktopResolver) { live.set(id, agent); return agent } } } } } },
     agents: { get: id => live.get(id), async resume(args) { calls.push(args); await options.beforeResume?.(); await args.setup?.(agentCtx, agent); live.set('B', agent); return { agent } } },
@@ -63,6 +64,8 @@ test('explicit resume override still mounts the original target preset and coupl
   assert.deepEqual(h.mounts, ['target-preset'])
   assert.deepEqual((await h.selected()).request, { provider: 'new-provider', model: 'new-model', reasoningEffort: 'custom-effort' })
   assert.deepEqual(h.checks, [{ provider: 'new-provider', model: 'new-model', reasoningEffort: 'custom-effort' }])
+  h.ctx.agents.get('B').session.append('model/selection', { provider: 'later-provider', model: 'later-model' })
+  assert.deepEqual((await h.selected()).request, { provider: 'later-provider', model: 'later-model' }, 'resumed selection must follow later native user changes')
 })
 
 test('preset and capability failures do not publish or record a partially composed target', async () => {

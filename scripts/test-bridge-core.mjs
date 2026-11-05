@@ -10,7 +10,7 @@
  * read path core.sessionEvents() probes (`snapshotEvents()`).
  */
 import assert from 'node:assert/strict'
-import { archivedEntries, foldMessages, isStalled, maxSeq, waitForReply } from '../src/core.ts'
+import { throwIfCollaborationAborted, archivedEntries, foldMessages, isStalled, maxSeq, waitForReply } from '../src/core.ts'
 
 let passed = 0
 let failed = 0
@@ -163,6 +163,18 @@ await test('archivedEntries: no titles at all still round-trips', () => {
   const entries = archivedEntries(['a', 'b'], new Map())
   assert.deepEqual(JSON.parse(JSON.stringify(entries)), entries)
   assert.deepEqual(entries, [{ sessionId: 'a' }, { sessionId: 'b' }])
+})
+
+await test('structured host cancellation has readable error and preserves original cause', () => {
+  const reason = { type: 'user-interrupt', source: 'host' }
+  const controller = new AbortController()
+  throwIfCollaborationAborted(controller.signal)
+  controller.abort(reason)
+  assert.throws(() => throwIfCollaborationAborted(controller.signal), error =>
+    error instanceof Error && error.message === 'collaboration cancelled' && error.cause === reason)
+  const revoked = new Error('Task material operation revoked')
+  assert.throws(() => throwIfCollaborationAborted(AbortSignal.abort(revoked)), error =>
+    error.message === revoked.message && error.cause === revoked)
 })
 
 // --- sanity -------------------------------------------------------------------

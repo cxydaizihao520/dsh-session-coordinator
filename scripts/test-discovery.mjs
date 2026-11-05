@@ -84,3 +84,9 @@ test('current native @ identities are available before collaboration setup, with
   assert.deepEqual((await h.tool.execute({}, exec)).nativeReferences, [])
   assert.deepEqual((await h.tool.execute({}, { ...exec, agent: { ...agent } })).nativeReferences, [], 'a caller snapshot cannot borrow the live session reference identity')
 })
+
+test('current state/sessions contract preserves complete native identities and pagination',async()=>{
+ const h=fixture(6);for(const [id,status]of [['s1','running'],['s2','idle']])h.live.set(id,{id,status,session:{header:h.headers.find(x=>x.id===id),events:[]}});
+ const idle=await h.find({state:'idle',mainOnly:true,archived:false});assert.deepEqual(idle.sessions.map(x=>[x.sessionId,x.state]),[['s2','idle']]);assert.deepEqual(idle.sessions,idle.items);
+ const offline=await h.find({state:'offline',mainOnly:true,archived:false});assert.deepEqual(offline.sessions.map(x=>x.sessionId).sort(),['s0','s4']);assert.equal(offline.complete,true);
+})
