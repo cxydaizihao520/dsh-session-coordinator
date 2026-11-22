@@ -11,7 +11,7 @@ import {reconcileDeliveryAdmission} from './coordination-records.ts'
 
 type Exec = { agent?: unknown; callId?: string; rootCallId?: string; parent?: unknown; signal: AbortSignal; concludeTurn?: () => void }
 type Result = { sessionId: string; messageId: string; admission: 'accepted' | 'rejected' | 'unknown'; artifacts?: CollaborationArtifact[]; afterCursor?: string; waitTarget?: SessionWaitTarget; skipped?: boolean; error?: { code: string; message: string } }
-type Receipt = { protocolVersion: 2; requestId: string; historical?: true; communicationHandle?: string; controlHandle?: string; results: Result[] }
+type Receipt = { protocolVersion: 2; requestId: string; historical?: true; nativeApproval?: 'allowed-once'; communicationHandle?: string; controlHandle?: string; results: Result[] }
 declare module '@deepseek-ai/dsh-session/types' {
   interface PluginRecordMap { 'plugin:dsh-session-coordinator/send-request': { version: number; owner: string; requestId: string; fingerprint: string } }
 }
@@ -43,12 +43,13 @@ export function createSendRequestConsumer(env: BridgeEnv) {
     if (args.context?.taskHandle !== undefined && (typeof args.context.taskHandle !== 'string' || !args.context.taskHandle.trim())) throw new Error('taskHandle requires an exact task reference')
     const requestId = args.requestId ?? 'request-' + hash([caller.id, exec.callId])
     if (!/^[\w-]{8,120}$/.test(requestId)) throw new Error('invalid requestId')
+    const messageIdFor = (sessionId: string) => 'message-' + hash(targets.length === 1 ? [caller.id, requestId] : [caller.id, requestId, sessionId])
     const fingerprint = JSON.stringify([targets, args.content, args.delivery ?? 'message', args.replyHandling ?? 'continue', args.replyTo, authorization ? [authorization.participants, authorization.purpose, authorization.extent, authorization.reply ?? null] : null, args.context?.communicationHandle, args.expectedExecution, args.requireRunning === true, ...(args.context?.taskHandle === undefined ? [] : [{taskHandle:args.context.taskHandle}]), ...(authorization?.controls===undefined?[]:[{controls:authorization.controls}])])
     const key = JSON.stringify([caller.id, requestId]), prior = requests.get(key)
     const frozen = sessionEvents(caller.session).filter(event => caller.session.isOwnSeq?.(event.seq) !== false).map(pluginRecordOf).filter(record => record?.type === RECORD && (record.data as { requestId?: string }).requestId === requestId)
     if (frozen.some(record => { const data = record!.data as { owner?: string; fingerprint?: string }; return data.owner !== caller.id || data.fingerprint !== fingerprint })) throw new Error('REQUEST_CONFLICT: persisted request binds the original complete group')
     if (!prior && frozen.length) return {protocolVersion:2,requestId,historical:true,results:await Promise.all(targets.map(async(sessionId):Promise<Result>=>{
-      const messageId='message-'+hash(targets.length===1?[caller.id,requestId]:[caller.id,requestId,sessionId])
+      const messageId = messageIdFor(sessionId)
       try{
         await reconcileDeliveryAdmission(env.ctx,caller.id,sessionId,messageId,exec.signal)
         return {sessionId,messageId,admission:'accepted'}
@@ -65,6 +66,15 @@ export function createSendRequestConsumer(env: BridgeEnv) {
       if (requests.get(key) !== prior) return requests.get(key)!.run
       preserved = previous.results.filter(result => result.admission !== 'rejected' || result.skipped)
     }
+    const replyTarget = targets[0]!
+    if (!prior && args.replyTo && args.context && args.context.taskHandle === undefined &&
+        env.delivery!.replyRequiresTaskHandle(caller, replyTarget, args.context.communicationHandle, args.replyTo)) {
+      throwIfCollaborationAborted(exec.signal)
+      return { protocolVersion: 2, requestId, results: [{
+        sessionId: replyTarget, messageId: messageIdFor(replyTarget), admission: 'rejected',
+        error: { code: 'TASK_CONTEXT_REQUIRED', message: 'TASK_CONTEXT_REQUIRED: Nothing was submitted. Add the original taskHandle to context and retry the same reply with this requestId.' },
+      }] }
+    }
     const run = async (): Promise<Receipt> => {
       const receipt: Receipt = { protocolVersion: 2, requestId, results: [] }
       let approval: Promise<void> | undefined
@@ -72,7 +82,9 @@ export function createSendRequestConsumer(env: BridgeEnv) {
       const authorize = async () => {
         throwIfCollaborationAborted(exec.signal); checkpoint()
         approval ??= requestCoordinationApproval(env.ctx, exec, 'session_coordinator_send', JSON.stringify({ targets, content: args.content, delivery: args.delivery ?? 'message', authorizationRequest: authorization ?? { participants: [caller.id, ...targets], purpose: 'deliver this message', extent: 'message', reply: 'none' } }))
-        await approval; throwIfCollaborationAborted(exec.signal); checkpoint()
+        await approval
+        receipt.nativeApproval = 'allowed-once'
+        throwIfCollaborationAborted(exec.signal); checkpoint()
       }
       const options = { protocolVersion: 2 as const, delivery: args.delivery, expectedExecution: args.expectedExecution, messageAuthorization: authorization?.extent === 'message', communicationHandle: args.context?.communicationHandle, ...(authorization?.extent === 'work' ? { workAuthorization: { participants: authorization.participants, purpose: authorization.purpose,controls:authorization.controls } } : {}), replyAllowed: authorization?.reply === 'once', signal: exec.signal, authorize }
       let scopeError: unknown
@@ -87,7 +99,7 @@ export function createSendRequestConsumer(env: BridgeEnv) {
       for (const sessionId of targets) {
         const old = preserved.find(result => result.sessionId === sessionId)
         if (old) { receipt.results.push(old); continue }
-        const messageId = 'message-' + hash(targets.length === 1 ? [caller.id, requestId] : [caller.id, requestId, sessionId])
+        const messageId = messageIdFor(sessionId)
         try {
           if (scopeError) throw scopeError
           throwIfCollaborationAborted(exec.signal)

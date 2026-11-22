@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import * as agentApi from '@deepseek-ai/dsh-agent'
+import { nativeModelSelection } from './fixtures/native-model.mjs'
 import { resumeBridgeSession } from '../src/session-create.ts'
 
 function harness(options = {}) {
@@ -23,7 +22,23 @@ function harness(options = {}) {
       : name === 'sessionProjections' ? { stateOf: () => modelState }
       : name === 'agentPresets' ? ctx.agentPresets : undefined,
     typert: { lookups: { get() { return options.noResolver ? undefined : { async resolve(id) { if (options.resolverError) throw new Error('native policy refused'); if (options.desktopResolver) { live.set(id, agent); return agent } } } } } },
-    agents: { get: id => live.get(id), async resume(args) { calls.push(args); await options.beforeResume?.(); await args.setup?.(agentCtx, agent); live.set('B', agent); return { agent } } },
+    agents: { get: id => live.get(id), async resume(args) {
+      calls.push(args)
+      await options.beforeResume?.()
+      if (agentApi.AgentModel) {
+        const definition = agentApi.modelSelectionProjectionDefinition
+        if (options.resumedHeader) events.push({ type: 'request/header', data: { header: options.resumedHeader } })
+        if (modelState?.pending && !events.some(event => event.type === 'model/selection')) {
+          events.push({ type: 'model/selection', data: modelState.pending })
+        }
+        agent.model = new agentApi.AgentModel(
+          () => events.reduce(definition.apply, definition.init()), agent.session, args.agentOptions,
+        )
+      }
+      await args.setup?.(agentCtx, agent)
+      live.set('B', agent)
+      return { agent }
+    } },
     agentPresets: { async resolve(id) { assert.equal(id, 'target-preset'); return { id } }, async mount(_ctx, id) { assert.equal(live.size, 0, 'mount before publication'); mounts.push(id); if (options.invalidPreset) throw new Error('preset missing') } },
     sessionPersistence: { async list() { return [{ header }] } },
     workspaceRegistry: { list: () => [], resolveByPath: async () => undefined },
@@ -32,6 +47,7 @@ function harness(options = {}) {
   return { ctx, calls, records, mounts, checks, get disposed() { return disposed },
     run: args => resumeBridgeSession(ctx, registry, { sessionId: 'B', ...args }),
     async selected() {
+      if (agent.model) return { request: agent.model.current() }
       assert.ok(hooks.has('system-prompt/assemble'), 'official installModelSelection must couple prompt and request')
       const assembly = await hooks.get('system-prompt/assemble')({}, {}, async () => ({ variables: {} }))
       const request = await hooks.get('agent/request')({}, async () => ({ provider: 'caller', model: 'caller', reasoningEffort: 'caller-effort' }))
@@ -104,12 +120,7 @@ test('concurrent same-target cold resumes share one writer; conflicting model ov
 })
 
 test('installed native projection wire next and internal pending remain distinct during resume setup', { skip: !existsSync('/Applications/DeepSeek Harness.app/Contents/Resources/app.asar') }, async () => {
-  // Execute the installed official projection; do not recreate its reducer or wire shape in the test.
-  let source = execFileSync(process.execPath, [fileURLToPath(new URL('../tools/asar.mjs', import.meta.url)), 'cat', '/dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/types/model-selection-projection.js'], { encoding: 'utf8' })
-  source = source.replace("from 'zod'", 'from ' + JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('zod')).href))
-  const native = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'))
-  let definition
-  native.installModelSelectionProjection({ sessionProjections: { register(value) { definition = value } } })
+  const { projection: definition } = await nativeModelSelection()
   const config = { provider: 'target-provider', model: 'target-model', reasoningEffort: 'target-effort' }
   const header = { config, adapterDefaults: { reasoningEffort: true } }
   for (const selected of [{ provider: 'pending-provider', model: 'pending-model' }, config]) {

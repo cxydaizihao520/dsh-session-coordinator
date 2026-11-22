@@ -291,7 +291,11 @@ window.__ModuleLoader__.load({
         typeof data.content[0].text !== 'string') return null
       const task = source.hopCount === 1 && source.replyTo === undefined && source.rootMessageId === source.messageId
       const reply = source.hopCount === 2 && nonempty(source.replyTo) && source.rootMessageId === source.replyTo
-      if (!task && !reply) return null
+      const chainedWorkReply = source.protocolVersion === 2 && nonempty(source.communicationHandle) &&
+        Number.isSafeInteger(source.hopCount) && source.hopCount > 2 &&
+        nonempty(source.rootMessageId) && nonempty(source.replyTo) &&
+        source.rootMessageId !== source.messageId && source.replyTo !== source.messageId && source.rootMessageId !== source.replyTo
+      if (!task && !reply && !chainedWorkReply) return null
       if (source.protocolVersion === 2) return { source, label: typeof source.senderLabel === 'string' ? source.senderLabel : '', body: data.content[0].text, message: data, event: event.pendingRecord ?? event }
       if (source.protocolVersion !== undefined) return null
       const message = protocolMessage(data.content[0].text, source)
@@ -323,11 +327,11 @@ window.__ModuleLoader__.load({
       },
     }
 
-    // rc.3 原生函数路由已核为非排他或与 session-message 互斥；未知路由保留原生显示，不调用其 matcher。
+    // 已核实的原生路由不排他或与 session-message 互斥；未知路由保留原生显示，不调用其 matcher。
     const NATIVE_MESSAGE_ROUTES = new Set([
       'input-message', 'developer-message', 'command', 'compaction', 'system-message',
       'request-prompt', 'model-retry', 'turn-error', 'turn-max-tokens',
-      'goal-command-input', 'submitted-plan', 'workflow-run', 'user-question-reply',
+      'goal-command-input', 'submitted-plan', 'workflow-run', 'user-question-reply', 'answered-user-question',
     ])
 
     function receivingIssue(events, definition, eventType) {

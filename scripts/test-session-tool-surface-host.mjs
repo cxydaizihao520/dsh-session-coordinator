@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {createRequire} from 'node:module'
@@ -28,8 +29,8 @@ for(const mixed of [false,true])test('first claimed old input is filtered during
  const ready=CollaborationRuntime.open(h.env,{...h.store,list:()=>gate})
  h.env.collaboration=ready;const surface=new SessionToolSurface(h.env,ready,new Map());h.env.toolSurface=surface
  const promptRoot=new Context(),prompt=new SystemPrompt(promptRoot,{})
- b.status='running';b.phase={kind:'running',turn:1,step:0,abort:new AbortController()};b.loopCtx={systemPrompt:prompt}
- b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},b.session,{emit(name,payload){h.ctx.emit(b,name,{agent:b,...payload})}})
+ b.status='running';b.phase={kind:'running',turn:1,step:0,abort:new AbortController()};b.model={current:()=>({provider:'probe',model:'probe'})};b.loopCtx={systemPrompt:prompt,tools:{resolve:async()=>({dispose(){},view:()=>new Map()})}}
+ b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,b.session,{emit(name,payload){h.ctx.emit(b,name,{agent:b,...payload})}})
  b.inbox.append('next-turn',wire)
  if(mixed)b.inbox.append('next-step',{id:'unrelated-input',role:'user',source:{kind:'user'},content:[{type:'text',text:'new independent user question'}]})
  b.dispatch={waterfall:(name,payload,next)=>h.ctx.waterfall(b,name,{agent:b,...payload},next)}
@@ -56,8 +57,8 @@ for(const mixed of [false])test('native pre-step cancellation does not wait for 
  const ready=CollaborationRuntime.open(h.env,{...h.store,list:()=>gate})
  h.env.collaboration=ready;const surface=new SessionToolSurface(h.env,ready,new Map());h.env.toolSurface=surface
  const promptRoot=new Context(),prompt=new SystemPrompt(promptRoot,{})
- b.status='running';b.phase={kind:'running',turn:1,step:0,abort:new AbortController()};b.loopCtx={systemPrompt:prompt}
- b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},b.session,{emit(name,payload){h.ctx.emit(b,name,{agent:b,...payload})}})
+ b.status='running';b.phase={kind:'running',turn:1,step:0,abort:new AbortController()};b.model={current:()=>({provider:'probe',model:'probe'})};b.loopCtx={systemPrompt:prompt,tools:{resolve:async()=>({dispose(){},view:()=>new Map()})}}
+ b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,b.session,{emit(name,payload){h.ctx.emit(b,name,{agent:b,...payload})}})
  b.inbox.append('next-turn',wire)
  if(mixed)b.inbox.append('next-step',{id:'unrelated-input',role:'user',source:{kind:'user'},content:[{type:'text',text:'new independent user question'}]})
  b.dispatch={waterfall:(name,payload,next)=>h.ctx.waterfall(b,name,{agent:b,...payload},next)}

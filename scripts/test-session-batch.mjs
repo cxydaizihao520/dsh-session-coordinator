@@ -2,6 +2,30 @@ import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {fixture} from './fixtures/session-tools.mjs'
 
+test('send returns the observed native approval without inferring one from admission or history', async () => {
+ const h = fixture()
+ h.human('A')
+ const args = {targets:['B'], content:'review once', requestId:'native-approval-receipt', authorizationRequest:{participants:['A','B'], purpose:'review', extent:'message', reply:'once'}}
+ const sent = await h.run('send', args)
+ assert.equal(sent.nativeApproval, 'allowed-once')
+ const reply = await h.run('send', {targets:['A'], content:'reviewed', replyTo:sent.results[0].messageId}, 'B')
+ assert.equal(reply.results[0].admission, 'accepted')
+ assert.equal(reply.nativeApproval, undefined)
+ assert.equal(h.approvals.length, 1)
+ h.reload()
+ const historical = await h.run('send', args)
+ assert.equal(historical.historical, true)
+ assert.equal(historical.nativeApproval, undefined)
+ assert.equal(h.approvals.length, 1)
+
+ const denied = fixture()
+ denied.human('A')
+ denied.setAnswer(async () => 'rejected')
+ const refused = await denied.run('send', args)
+ assert.equal(refused.results[0].admission, 'rejected')
+ assert.equal(refused.nativeApproval, undefined)
+})
+
 test('one frozen work permission admits a deduplicated group and member-to-member communication',async()=>{
  const h=fixture();h.human('A');h.make('C');const first=await h.run('send',{targets:['C','B','B'],content:'review together',requestId:'group-work-one',authorizationRequest:{participants:['A','B','C','A'],purpose:'implement and review',extent:'work'}});
  assert.equal(first.results.length,2);assert.ok(first.results.every(x=>x.admission==='accepted'));assert.equal(h.approvals.length,1);

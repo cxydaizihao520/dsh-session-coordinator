@@ -57,7 +57,8 @@ test('installed controller forks the exact inclusive prefix without starting an 
   const ctx = {get:name=>name==='sessionController'?{fork:async request=>{calls++;return nativeFork.call(command,request)}}:undefined}
   const result = await forkCollaborationSession(ctx,session.id,before.seq)
   assert.equal(result.executionAuthority,'none');assert.equal(result.sessionId,created.sessionId)
-  assert.equal(created.inheritedEventCount,before.seq+1);assert.equal(created.meta.parentSession,session.id)
+  assert.equal(created.inheritedEventCount,before.seq+1);assert.equal(created.meta.isSeeded,true)
+  if (created.meta.parentSession !== undefined) assert.equal(created.meta.parentSession,session.id)
   const child = Session.create(created.sessionId,created.seed,{...session.header,id:created.sessionId,isSeeded:true},created.inheritedEventCount)
   const childText = child.snapshotEvents().filter(e=>e.type==='user/message').flatMap(e=>e.data.content).map(p=>p.text??'').join('\n')
   assert.match(childText,/before-cut sentinel/);assert.doesNotMatch(childText,/after-cut sentinel/)

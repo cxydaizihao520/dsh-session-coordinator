@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 // Installed LocalJobRegistry with scratch Sessions and controlled producers; no business process.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
@@ -103,7 +104,7 @@ test('native self-cancel stops the producer before native turn/end confirms exec
   const nativeCancel=method('\tcancel(cause, options = {}) {','\n\trunMaintenance(')
   const causeStart=source.indexOf('function abortedCancelCause('),causeEnd=source.indexOf('\n/** Drives',causeStart)
   const cause=new Function('assertNever',source.slice(causeStart,causeEnd)+'\nreturn abortedCancelCause')(x=>{throw Error('unexpected cause '+JSON.stringify(x))})
-  const turn=method('\tasync turn() {','\n\tasync step(',['ToolCallRecovery','abortedCancelCause','LlmError','errorChain'],[ToolCallRecovery,cause,LlmError,errorChain])
+  const turn=method('\tasync turn() {','\n\tasync step(',['ToolCallRecovery','abortedCancelCause','LlmError','errorChain','ToolActivationError'],[ToolCallRecovery,cause,LlmError,errorChain,class ToolActivationError extends Error {}])
   const task=await h.run('task',{communicationHandle:h.communicationHandle,objective:'self owned result processing',members:['B'],requestId:'native-self-task-001'}),a=h.agents.get('A')
   h.human('B')
   const sent=await h.run('send',{targets:['B'],content:'review',context:{communicationHandle:h.communicationHandle,taskHandle:task.taskHandle}})
@@ -111,7 +112,7 @@ test('native self-cancel stops the producer before native turn/end confirms exec
   const reply=await h.run('send',{targets:['A'],content:'review result',replyTo:sent.results[0].messageId,delivery:'queue',context:{communicationHandle:h.communicationHandle,taskHandle:task.taskHandle}},'B')
   assert.equal(reply.results[0].admission,'accepted',JSON.stringify(reply))
   const abort=new AbortController();a.phase={kind:'running',turn:0,step:0,abort,wakeRequested:false};a.status='running';a.cancel=nativeCancel;a.throwError=error=>{throw error};a.dispatch={serial:async()=>{}}
-  a.preStep=async(_timing,{turn,step})=>{const messages=a.inbox.nextTurn.splice(0);for(const message of messages)for(const fn of h.listeners.get('agent/inbox/claimed')??[])fn({agent:a,message,turn});const payload={agent:a,turn,step,signal:abort.signal,messages};return (h.listeners.get('agent/pre-step')??[]).reduceRight((next,fn)=>()=>fn(payload,next),async()=>({kind:'enter',messages}))()}
+  a.preStep=async(_timing,{turn,step})=>{const messages=a.inbox.nextTurn.splice(0);for(const message of messages)for(const fn of h.listeners.get('agent/inbox/claimed')??[])fn({agent:a,message,turn});const payload={agent:a,turn,step,signal:abort.signal,messages};const decision=await (h.listeners.get('agent/pre-step')??[]).reduceRight((next,fn)=>()=>fn(payload,next),async()=>({kind:'enter',messages}))();return {...decision,toolSet:{dispose(){}}}}
   let controlResult,jobId
   a.step=async decision=>{
    for(const message of decision.messages)a.session.append('user/message',message,{surfaceOp:'append'})
@@ -183,15 +184,19 @@ const loopSource=execFileSync(process.execPath,['tools/asar.mjs','cat','/dsh/nod
 const inboxStart=loopSource.indexOf('//#region lib/types/inbox.js'),inboxEnd=loopSource.indexOf('//#endregion',inboxStart)
 const {ReactLoopInbox,inboxProjectionDefinition}=new Function('z$1',loopSource.slice(inboxStart,inboxEnd)+';return {ReactLoopInbox,inboxProjectionDefinition}')(z)
 const turnStart=loopSource.indexOf('\tasync turn() {'),turnEnd=loopSource.indexOf('\n\tasync step(',turnStart)
-const nativeTurn=new Function('ToolCallRecovery','LlmError','errorChain','abortedCancelCause','return '+loopSource.slice(turnStart,turnEnd).trim().replace('async turn()','async function()'))(ToolCallRecovery,LlmError,errorChain,()=>undefined)
-const projectionStart=loopSource.indexOf('\tproject(current, sections) {'),projectionEnd=loopSource.indexOf('\n\t}\n};',projectionStart)+3
-const projectContext=new Function('createUserMessage','SOURCE','CLEARED','return '+loopSource.slice(projectionStart,projectionEnd).trim().replace('project(current, sections)','function(current, sections)'))(createUserMessage,'runtime-context','cleared')
+const nativeTurn=new Function('ToolCallRecovery','LlmError','errorChain','abortedCancelCause','ToolActivationError','return '+loopSource.slice(turnStart,turnEnd).trim().replace('async turn()','async function()'))(ToolCallRecovery,LlmError,errorChain,()=>undefined,class ToolActivationError extends Error {})
+const projectionStart=loopSource.indexOf('\tproject(sections) {')
+const projectionEnd=loopSource.indexOf('\n\t}\n};',projectionStart)+3
+assert.ok(projectionStart>=0&&projectionEnd>projectionStart)
+const projectContext=new Function('createUserMessage','SOURCE','CLEARED','deepEqualJson',
+ 'return '+loopSource.slice(projectionStart,projectionEnd).trim().replace('project(sections)','function(sections)'),
+)(createUserMessage,'runtime-context','cleared',()=>false)
 for(const scenario of ['normal','cancelled-only','cancelled-with-other','cancelled-existing-step'])test('native turn does not start empty model work after task cancellation: '+scenario,async()=>{
  const h=await prepared(),sessions=new SessionStore(h.root),session=sessions.prepare('B'),leave=sessions.enter(session);sessions.announce(session)
  try {
   const b=h.agents.get('B');b.session=session
   h.root.on('session/event',(s,e)=>{for(const fn of h.listeners.get('session/event')??[])fn(s,e)})
-  b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
+  b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
   b.followup=m=>b.inbox.append('next-turn',m);b.steer=m=>b.inbox.append('next-step',m)
   const task=await h.run('task',{communicationHandle:h.communicationHandle,objective:'shipping',members:['B'],requestId:'prestep-task-'+scenario})
   const sendTask=()=>h.run('send',{targets:['B'],content:'shipping work',delivery:scenario==='cancelled-existing-step'?'message':'queue',context:{communicationHandle:h.communicationHandle,taskHandle:task.taskHandle}})
@@ -202,7 +207,7 @@ for(const scenario of ['normal','cancelled-only','cancelled-with-other','cancell
    const messages=b.inbox.claim(_timing,turn)
    if(scenario!=='normal'&&(scenario!=='cancelled-existing-step'||step>1))await h.run('control',{object:'task',action:'cancel',taskHandle:task.taskHandle,expectedRevision:1,reason:'stop shipping now',requestId:'prestep-control-'+scenario})
    const payload={agent:b,turn,step,messages,signal:abort.signal}
-   return (h.listeners.get('agent/pre-step')??[]).reduceRight((next,fn)=>()=>fn(payload,next),async()=>({kind:'enter',messages:[...messages,projectContext.call({},'native runtime facts',[])]}))()
+   const decision=await (h.listeners.get('agent/pre-step')??[]).reduceRight((next,fn)=>()=>fn(payload,next),async()=>({kind:'enter',messages:[...messages,projectContext.call({},[{name:'native-probe',text:'native runtime facts'}])]}))();return {...decision,toolSet:{dispose(){}}}
   }
   const steps=[];b.step=async decision=>{steps.push(decision.messages);for(const message of decision.messages)session.append('user/message',message,{surfaceOp:'append'});if(scenario==='cancelled-existing-step'&&steps.length===1)assert.equal((await sendTask()).results[0].admission,'accepted');return {kind:'completed'}}
   await nativeTurn.call(b)

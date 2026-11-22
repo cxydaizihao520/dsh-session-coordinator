@@ -242,6 +242,33 @@ test('send request identity freezes the declared task and exact revision',async(
  assert.equal(h.effects.filter(row=>row[0]==='send'&&row[2].id===accepted.results[0].messageId).length,1)
 })
 
+test('a verified task reply can add its missing handle without losing its original request identity',async()=>{
+ const h=await tasksFixture()
+ const communicationHandle=h.communicationHandle
+ const task=await h.run('task',{communicationHandle,objective:'verify the original shipment',members:['B'],requestId:'task-repair-source'})
+ const context={communicationHandle,taskHandle:task.taskHandle}
+ const sent=await h.run('send',{targets:['B'],content:'verify shipping',context})
+ const args={targets:['A'],content:'verified total',replyTo:sent.results[0].messageId,requestId:'task-repair-reply',context:{communicationHandle}}
+ const missing=await h.run('send',args,'B')
+ assert.equal(missing.results[0].admission,'rejected')
+ assert.match(missing.results[0].error.message,/TASK_CONTEXT_REQUIRED/)
+ const repaired=await h.run('send',{...args,context},'B')
+ assert.equal(repaired.results[0].admission,'accepted')
+ assert.equal(repaired.results[0].messageId,missing.results[0].messageId)
+ assert.deepEqual(await h.run('send',{...args,context},'B'),repaired)
+ await assert.rejects(h.run('send',args,'B'),/REQUEST_CONFLICT/)
+ assert.equal(h.effects.filter(row=>row[0]==='send'&&row[2].id===repaired.results[0].messageId).length,1)
+
+ const another = {...args,requestId:'task-repair-after-finish'}
+ assert.equal((await h.run('send',another,'B')).results[0].error.code,'TASK_CONTEXT_REQUIRED')
+ const finished=await h.run('control',{object:'task',action:'finish',taskHandle:task.taskHandle,expectedRevision:1,reason:'verified shipment',evidenceRefs:[repaired.results[0].messageId],requestId:'task-repair-finish'})
+ assert.equal(finished.state,'completed')
+ const late=await h.run('send',{...another,context},'B')
+ assert.equal(late.results[0].admission,'rejected')
+ assert.match(late.results[0].error.message,/collaboration is not active: verified shipment/)
+ assert.equal(h.effects.some(row=>row[0]==='send'&&row[2].id===late.results[0].messageId),false)
+})
+
 test('once-reply conclusion consults the actual shared task runtime and its lifecycle',async()=>{
  for(const scenario of ['clear','ready-other','waiting-other','paused-other','finished-other','runtime-closed']) {
   const h=await tasksFixture(),b=h.agents.get('B'),runtime=await h.env.collaboration

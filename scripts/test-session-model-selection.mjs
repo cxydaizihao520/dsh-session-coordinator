@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {Session} from '@deepseek-ai/dsh-session'
+import * as agentApi from '@deepseek-ai/dsh-agent'
 import {createBridgeSession} from '../src/session-create.ts'
 import {readSessionModelSelection} from '../src/session-model-selection.ts'
-import {execFileSync} from 'node:child_process'
+import {nativeModelSelection} from './fixtures/native-model.mjs'
 import {existsSync} from 'node:fs'
 
-function harness(projection) {
+function harness(projection=agentApi.modelSelectionProjectionDefinition) {
  const hooks=new Map(), sessions=new Map();let pending=null
  const ctx={get(name){return name==='llm'?{resolveCallConfig:async x=>x}:name==='sessionProjections'?{stateOf:session=>projection?session.snapshotEvents().reduce((s,e)=>projection.apply(s,e),projection.init()):({pending})}:name==='agentDefaultModel'?{currentSelection:()=>({provider:'global',model:'default'})}:undefined},
   workspaceRegistry:{list:()=>[],resolveByPath:async()=>undefined},agentPresets:{composedPreset(){}},
@@ -14,12 +15,22 @@ function harness(projection) {
    const session=Session.create(options.sessionId),agentCtx={get:name=>ctx.get(name),on(name,fn){hooks.set(name,fn);return()=>{}}}
    const append=session.append.bind(session);session.append=(type,data,...rest)=>{const event=append(type,data,...rest);if(type==='model/selection')pending=data;return event}
    const agent={id:options.sessionId,ctx:agentCtx,session,options:options.agentOptions,status:'idle'}
+   if(agentApi.AgentModel)agent.model=new agentApi.AgentModel(
+    ()=>session.snapshotEvents().reduce(projection.apply,projection.init()),session,agent.options,
+   )
    await options.setup?.(agentCtx,agent);sessions.set(agent.id,agent);return {agent}
   }}}
  let agent
- return {ctx,hooks,get agent(){return agent},async create(){agent=(await createBridgeSession(ctx,{record(){}},{sessionId:'model-route',cwd:'/tmp',provider:'chosen',model:'vision'})).agent;return agent},
+ return {ctx,hooks,get agent(){return agent},async create(route={provider:'chosen',model:'vision'}){agent=(await createBridgeSession(ctx,{record(){}},{sessionId:'model-route',cwd:'/tmp',...route})).agent;return agent},
   select(value){agent.session.append('model/selection',value);pending=value},
   async route(duringAssembly){
+   // The newer loop captures AgentModel.current() before assembly.
+   if(agent.model){
+    const request=agent.model.current()
+    assert.ok(request, 'the rc.5 loop requires a selected route before assembly')
+    await duringAssembly?.()
+    return {assembly:{provider:request.provider,model:request.model},request}
+   }
    const assembly=await hooks.get('system-prompt/assemble')({}, {},async()=>{await duringAssembly?.();return {variables:{provider:'global',model:'default'}}})
    const request=await hooks.get('agent/request')({},async()=>({provider:'global',model:'default',reasoningEffort:'inherited'}))
    return {assembly:assembly.variables,request}
@@ -53,18 +64,28 @@ test('an external empty chat with conflicting initial options and changed defaul
 })
 
 test('creation without an explicit model still uses the native default',async()=>{
- const h=harness();const created=await createBridgeSession(h.ctx,{record(){}},{sessionId:'default-route',cwd:'/tmp'})
- assert.deepEqual(readSessionModelSelection(created.agent),{provider:'global',model:'default'})
+ const h=harness();const created=await h.create({})
+ assert.deepEqual(readSessionModelSelection(created),{provider:'global',model:'default'})
  assert.deepEqual((await h.route()).request,{provider:'global',model:'default'})
 })
 
 test('installed rc.5 native projection and native assembly consume the shared public route', {skip:!existsSync('/Applications/DeepSeek Harness.app/Contents/Resources/app.asar')},async()=>{
- const host=path=>execFileSync(process.execPath,['tools/asar.mjs','cat','/dsh/node_modules/@deepseek-ai/'+path],{encoding:'utf8'})
- const load=source=>import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'))
- const projectionModule=await load(host('dsh-api-session-controller/lib/types/model-selection-projection.js').replace("from 'zod'",'from '+JSON.stringify(import.meta.resolve('zod'))))
- let projection;projectionModule.installModelSelectionProjection({sessionProjections:{register:p=>projection=p}})
- const native=await load(host('dsh-agent/lib/types/model-selection.js').replace("from '@deepseek-ai/dsh-llm'",'from '+JSON.stringify(import.meta.resolve('@deepseek-ai/dsh-llm'))))
- const h=harness(projection);await h.create()
+ const native=await nativeModelSelection()
+ const h=harness(native.projection);await h.create()
+ if (native.AgentModel) {
+  const {session,options}=h.agent
+  const selection=new native.AgentModel(
+   ()=>session.snapshotEvents().reduce(native.projection.apply,native.projection.init()),
+   session,options,
+  )
+  const current=selection.current()
+  assert.deepEqual(current,{provider:'chosen',model:'vision'})
+  selection.select({provider:'ui',model:'native-next'})
+  assert.deepEqual(current,{provider:'chosen',model:'vision'})
+  assert.deepEqual(selection.current(),{provider:'ui',model:'native-next'})
+  assert.deepEqual(readSessionModelSelection(h.agent),selection.current())
+  return
+ }
  native.installModelSelection(h.agent.ctx,{get current(){return readSessionModelSelection(h.agent)}})
  assert.equal((await h.route()).request.model,'vision')
  const first=await h.route(()=>h.select({provider:'ui',model:'native-next'}))

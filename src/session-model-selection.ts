@@ -34,6 +34,10 @@ export function readSessionModelSelection(agent: LiveAgentLike): SessionModelSel
 export function recordSessionModelSelection(agent: LiveAgentLike, selection: unknown): boolean {
   const selected = exact(selection)
   if (!selected) return false
+  if (agent.model) {
+    agent.model.select(selected)
+    return true
+  }
   const projections = agent.ctx.get?.('sessionProjections') as { stateOf(session: unknown, key: string): unknown } | undefined
   if (!projections?.stateOf?.(agent.session, 'modelSelection')) return false
   // Controller-owned event is public at runtime but not declared by the peer-floor agent package.

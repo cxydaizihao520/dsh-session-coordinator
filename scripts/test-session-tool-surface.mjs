@@ -67,7 +67,7 @@ test('native schema and dispatch hide duplicate read aliases while genuine old c
  for(const agent of [a,b,c])for(const name of ['segments','message_status']){
   const full='session_coordinator_'+name
   assert.equal(h.tools.get(full,agent),undefined)
-  assert(!h.tools.sdkSchemas(agent).some(tool=>tool.name===full))
+  assert(!h.sdkSchemas(agent).some(tool=>tool.name===full))
  }
  assert.equal((await h.invoke('message_status',{sessionId:'B',messageId:'unknown'})).isError,true)
  await h.legacy()
@@ -85,12 +85,12 @@ test('native schemas SDK and dispatch expose legacy tools only to genuine scope 
  for(const agent of [a,b,c]){assert.equal(h.tools.get('session_coordinator_collaboration_start',agent),undefined);assert.equal(h.tools.get('session_coordinator_collaboration_task',agent),undefined);assert.ok(h.tools.schemas(agent).some(x=>x.name==='native_team'))}
  assert.equal((await h.invoke('collaboration_task',{scopeId:'invented',objective:'wrong',members:['B']})).isError,true)
  const scope=await h.legacy()
- for(const agent of [a,b])assert.ok(h.tools.sdkSchemas(agent).some(x=>x.name==='session_coordinator_collaboration_task'))
+ for(const agent of [a,b])assert.ok(h.sdkSchemas(agent).some(x=>x.name==='session_coordinator_collaboration_task'))
  assert.equal(h.tools.get('session_coordinator_collaboration_task',c),undefined)
  const task=await h.run('collaboration_task',{scopeId:scope.id,objective:'old work continues',members:['B']})
  const operation=await h.run('collaboration_send',{scopeId:scope.id,taskId:task.id,taskRevision:1,sessionId:'B',intent:'task',message:'actual legacy business work'})
  assert.equal(operation.status,'submitted');assert.equal(h.effects.at(-1).message.content[0].text,'actual legacy business work')
- const team=await h.tools.execute({...h.exec(),name:'native_team',arguments:{}});assert.equal(team.isError,false);assert.equal(teamCalls,1)
+ const team=await h.dispatch({...h.exec(),name:'native_team',arguments:{}});assert.equal(team.isError,false);assert.equal(teamCalls,1)
  const cached=h.tools.get('session_coordinator_collaboration_task',a)
  await h.run('collaboration_control',{scopeId:scope.id,action:'cancel',reason:'close this old scope'})
  assert.equal(h.tools.get('session_coordinator_collaboration_task',a),undefined)

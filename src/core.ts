@@ -26,6 +26,7 @@ export interface LiveAgentLike {
   readonly status: 'running' | 'idle'
   readonly session: Session
   readonly options?: { provider?: string; model?: string; reasoningEffort?: string }
+  readonly model?: { select(selection: { provider: string; model: string; reasoningEffort?: string }): void }
   followup(message: unknown): void
   steer(message: unknown): void
   inject?(message: unknown): void

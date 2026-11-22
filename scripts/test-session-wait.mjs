@@ -20,6 +20,31 @@ test('wait consumes only the selected new reply and returns a reusable per-chat 
  assert.deepEqual(JSON.parse(render[0].text).cursors,got.cursors)
 })
 
+test('wait keeps two correlated replies from the same chat independent',async()=>{
+ const h=fixture();h.human('A')
+ const first=await h.run('send',{targets:['B'],content:'first request',authorizationRequest:{participants:['A','B'],purpose:'review two items',extent:'work'}})
+ const context={communicationHandle:first.communicationHandle}
+ const second=await h.run('send',{targets:['B'],content:'second request',context})
+ const targets=[first.results[0].waitTarget,second.results[0].waitTarget]
+ const reply=(index,content)=>h.run('send',{targets:['A'],content,replyTo:targets[index].replyTo,context},'B')
+ await reply(1,'second answer')
+ const partial=await h.run('wait',{targets,mode:'all',timeoutMs:1})
+ assert.equal(partial.timedOut,true)
+ assert.deepEqual(partial.updates.map(update=>[update.replyTo,update.messages[0].text]),[[targets[1].replyTo,'second answer']])
+ assert.deepEqual(partial.cursors.map(cursor=>cursor.replyTo),targets.map(target=>target.replyTo))
+ await reply(0,'first answer')
+ const remaining=await h.run('wait',{targets:partial.cursors,mode:'any',timeoutMs:10})
+ assert.deepEqual(remaining.updates.map(update=>[update.replyTo,update.messages[0].text]),[[targets[0].replyTo,'first answer']])
+ const all=await h.run('wait',{targets,mode:'all',timeoutMs:10})
+ assert.equal(all.timedOut,false)
+ assert.deepEqual(all.updates.map(update=>update.replyTo),targets.map(target=>target.replyTo))
+ const invalid=[{...targets[0],afterCursor:'invalid'},targets[1]]
+ const other=await h.run('wait',{targets:invalid,mode:'any',timeoutMs:10})
+ assert.equal(other.errors[0].replyTo,targets[0].replyTo)
+ assert.equal(other.updates[0].replyTo,targets[1].replyTo)
+ await assert.rejects(h.run('wait',{targets:[targets[0],{...targets[0],afterCursor:targets[1].afterCursor}]}),/unique/)
+})
+
 test('wait any/all retains per-target failures and cancellation never stops the target',async()=>{
  const h=fixture();h.human('A');h.make('C')
  const b=await h.run('status',{sessionId:'B'}),c=await h.run('status',{sessionId:'C'})

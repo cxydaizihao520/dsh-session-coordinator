@@ -2,19 +2,15 @@
 
 让 DeepSeek Harness 的独立会话分工做事。一个会话负责实现，另一个负责复核，你在原会话看结果。每个会话都有自己的历史，之后还能打开接着聊。
 
-**0.2.20 公开预览版 · 最低宿主版本 DeepSeek Harness 0.2.1-rc.1**
+**正式版 0.2.20**。最低宿主版本为 DeepSeek Harness 0.2.1-rc.1，已在 macOS 的 DSH 0.2.2-rc.5 实测。
 
-## 安装
+## 从插件市场安装
 
-在 DeepSeek Harness 的插件市场搜索 `dsh-session-coordinator`，点击**安装**，然后重启 Harness。
+1. 打开 DeepSeek Harness 的 **插件 → 插件市场**。如果还没有插件市场页签，在 **插件 → 添加插件** 中安装并启用 `dshmarket`。
+2. 搜索 `dsh-session-coordinator`，点击 **安装** 并确认。
+3. 安装完成后，按提示点击 **刷新页面**。看到插件已生效后，打开一个标准会话直接使用。
 
-想固定在 0.2.20，可以从 [GitHub 预发布](https://github.com/cxydaizihao520/dsh-session-coordinator/releases/tag/v0.2.20)下载 `.tgz`，再运行 `dsh plugin --profile desktop add ./dsh-session-coordinator-0.2.20.tgz`。也可以从 GitHub 源码安装。
-
-```bash
-dsh plugin --profile desktop add 'git+https://github.com/cxydaizihao520/dsh-session-coordinator.git#main'
-```
-
-源码安装可能需要批准本插件的构建。npm 预览包发布后，可用 `dsh-session-coordinator@beta` 安装。版本核对及排障见[安装手册](docs/INSTALL.md)。
+全程可在桌面界面完成，无需执行命令。固定的 0.2.20 安装包见 [GitHub 正式发布页](https://github.com/cxydaizihao520/dsh-session-coordinator/releases/tag/v0.2.20)。其他安装方式与排障见[安装手册](docs/INSTALL.md)。
 
 ## 第一次用
 
@@ -36,7 +32,7 @@ dsh plugin --profile desktop add 'git+https://github.com/cxydaizihao520/dsh-sess
 
 安装并启用后，在受支持的标准会话中直接用自然语言提出需求。Agent 负责调用工具和收取结果。自定义会话禁用工具或缺少原生作业服务时，保留宿主设置及实际限制。
 
-macOS 上已在 DSH 0.2.1-rc.5 实际安装并加载本版。独立停止并行后台作业、暂停后的迟到保护和恢复只补剩余等场景仍待完整桌面验收。详见[验收说明](docs/ACCEPTANCE.md)。
+已核对干净桌面的市场安装，并验证自主多轮交接、忙时收信、同会话单项停止、暂停后的迟到保护以及恢复只补剩余。详见[验收说明](docs/ACCEPTANCE.md)。
 
 发送与创建在缺少相应授权时，通过原生审批明确参与者、用途和操作；已有有效授权直接复用。单条通知不要求回复；需要业务回报时可以批准一次回信；持续协作获批后，成员可在范围内直接互发，无默认固定交接次数。首次可一并批准明确的控制操作，范围内复用；扩大成员、用途或控制范围再确认。通信许可不默认赠送控制权。普通通信无需创建 task 或 Goal，也无需强制关闭步骤。
 

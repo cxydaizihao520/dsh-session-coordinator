@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 // Explicit installed-host method probe; scratch Sessions only, no application/model calls.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
@@ -13,7 +14,7 @@ assert.ok(sendStart>=0&&sendEnd>sendStart)
 const nativeSend=new Function('return '+source.slice(sendStart,sendEnd).trim().replace(/^send\(/,'function send('))()
 function nativeAgent(h){
  const a=h.agents.get('B'),abort=new AbortController();a.status='running';a.phase={kind:'running',abort};a.wakeDriver=()=>h.effects.push(['wake'])
- a.inbox=new ReactLoopInbox({stateOf:session=>session.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},a.session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:a,...payload})}})
+ a.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,a.session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:a,...payload})}})
  a.send=nativeSend;a.steer=m=>a.send(m,'next-step',true);a.followup=m=>a.send(m,'next-turn',true)
  return {a,abort}
 }
@@ -61,7 +62,7 @@ test('mounted Session publication defers strict removal and fences a racing next
  const handlers=new Map(),agents=new Map(),errors=[]
  const ctx={on(name,fn){root.on(name,(...args)=>{try{return fn(...args)}catch(error){errors.push(error);throw error}});const list=handlers.get(name)??[];list.push(fn);handlers.set(name,list)},effect(){},agents:{get:id=>agents.get(id)},sessions:{flush:async()=>true}}
  const a={id:String(session.id),session,status:'running'};agents.set(a.id,a)
- a.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},session,{emit(name,payload){for(const fn of handlers.get(name)??[])fn({agent:a,...payload})}})
+ a.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,session,{emit(name,payload){for(const fn of handlers.get(name)??[])fn({agent:a,...payload})}})
  a.send=(m,target)=>a.inbox.append(target,m)
  const state=new SessionDeliveryState(ctx,()=>{}),first=new AbortController();session.append('turn/start',{turn:1})
  const pre=handlers.get('agent/pre-step')[0]

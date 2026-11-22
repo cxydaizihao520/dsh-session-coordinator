@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 // Installed rc.5 services and Inbox on scratch sessions; provider answers are controlled, not desktop input.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
@@ -10,11 +11,11 @@ import {z} from 'zod'
 import {tasksFixture} from './fixtures/session-tasks.mjs'
 const host=name=>execFileSync(process.execPath,['tools/asar.mjs','cat','/dsh/node_modules/'+name+'/lib/index.js'],{encoding:'utf8'})
 let approvalSource=host('@deepseek-ai/dsh-user-approval')
-for(const name of ['@deepseek-ai/cordis','@deepseek-ai/schemastery','@deepseek-ai/dsh-llm','@deepseek-ai/dsh-scope','@deepseek-ai/dsh-session'])approvalSource=approvalSource.replaceAll('"'+name+'"',JSON.stringify(import.meta.resolve(name==='@deepseek-ai/cordis'?'cordis':name)))
-const {ApprovalService}=await import('data:text/javascript;base64,'+Buffer.from(approvalSource).toString('base64'))
+for(const name of ['@deepseek-ai/cordis','@deepseek-ai/schemastery','@deepseek-ai/dsh-llm','@deepseek-ai/dsh-scope','@deepseek-ai/dsh-session','zod'])approvalSource=approvalSource.replaceAll('"'+name+'"',JSON.stringify(import.meta.resolve(name==='@deepseek-ai/cordis'?'cordis':name)))
+const {ApprovalService,approvalStateDefinition}=await import('data:text/javascript;base64,'+Buffer.from(approvalSource+'\nexport { approvalStateDefinition }').toString('base64'))
 const questionSource=host('@deepseek-ai/dsh-user-questions')
 const slice=(source,first,last)=>{const start=source.indexOf(first),end=source.indexOf(last,start);assert.ok(start>=0&&end>start);return source.slice(start,end)}
-const questionMethods=new Function('HarnessError','scopeTarget',slice(questionSource,'var UserQuestionError =','let UserQuestionService =')+'\nreturn {'+slice(questionSource,'\t\tassertLiveRoot(agent) {','\n\t\tcontinued(')+','+slice(questionSource,'\t\tasync ask(request) {','\n\t};')+'}')(HarnessError,scopeTarget)
+const questionMethods=new Function('HarnessError','scopeTarget','restoreUserQuestionError','abortedQuestion',slice(questionSource,'var UserQuestionError =','let UserQuestionService =')+'\nreturn {'+slice(questionSource,'\t\tassertLiveRoot(agent) {','\n\t\tcontinued(')+','+slice(questionSource,'\t\tasync ask(request) {','\n\t};')+'}')(HarnessError,scopeTarget,error=>error,cause=>new Error('native question aborted',{cause}))
 const loop=host('@deepseek-ai/dsh-agent-loop')
 const {ReactLoopInbox,inboxProjectionDefinition}=new Function('z$1',slice(loop,'//#region lib/types/inbox.js','//#endregion')+'\nreturn {ReactLoopInbox,inboxProjectionDefinition}')(z)
 
@@ -23,9 +24,12 @@ async function mounted(){
  new(class extends Service{constructor(c){super(c,'agents')}get(id){return h.agents.get(id)}roots(){return [...h.agents.values()]}})(root)
  const approval=new ApprovalService(root,{policy:'ask'}),questions={ctx:root,...questionMethods},get=h.ctx.get
  h.ctx.get=name=>name==='approval'?approval:name==='userQuestions'?questions:get(name)
+ const caller=h.agents.get('A')
+ caller.session.append('turn/start',{turn:1})
+ approval.approvalProjectionHandle={stateOf:session=>session.snapshotEvents().reduce(approvalStateDefinition.apply,approvalStateDefinition.init())}
  const sessions=new SessionStore(root),b=h.agents.get('B'),session=sessions.prepare('B'),leave=sessions.enter(session);sessions.announce(session);b.session=session
  root.on('session/event',(session,event)=>{for(const fn of h.listeners.get('session/event')??[])fn(session,event)})
- b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
+ b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
  b.steer=message=>b.inbox.append('next-step',message);b.followup=message=>b.inbox.append('next-turn',message)
  return {...h,root,b,runtime,async close(){await runtime.close();leave();await root.fiber.dispose()}}
 }

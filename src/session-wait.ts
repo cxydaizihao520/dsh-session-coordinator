@@ -20,20 +20,29 @@ function cursorSeq(target: SessionWaitTarget): number {
   } catch { throw new Error('invalid afterCursor: use the cursor for this exact session') }
 }
 export async function waitSessions(ctx: Context, callerId: string, targets: SessionWaitTarget[], mode: 'any' | 'all', timeoutMs: number, signal: AbortSignal) {
-  const cursors = new Map<string, number>(), errors: Array<{ sessionId: string; error: string }> = []
-  const updates: Array<{ sessionId: string; messages: unknown[]; stateChanges: unknown[] }> = []
+  const slots = targets.map(target => {
+    const slot: { target: SessionWaitTarget; cursor?: number; error?: string; updated: boolean } = { target, updated: false }
+    try { slot.cursor = cursorSeq(target) }
+    catch (error) { slot.error = (error as Error).message }
+    return slot
+  })
+  const updates: Array<{ sessionId: string; replyTo?: string; messages: unknown[]; stateChanges: unknown[] }> = []
+  const identityOf = ({ sessionId, replyTo }: SessionWaitTarget) => ({ sessionId, ...(replyTo === undefined ? {} : { replyTo }) })
   let pendingInput = false
-  for (const target of targets) {
-    try { cursors.set(target.sessionId, cursorSeq(target)) }
-    catch (error) { errors.push({ sessionId: target.sessionId, error: (error as Error).message }) }
-  }
   const started = Date.now()
   while (!signal.aborted) {
-    await Promise.all(targets.map(async target => {
-      if (!cursors.has(target.sessionId) || updates.some(update => update.sessionId === target.sessionId) || errors.some(error => error.sessionId === target.sessionId)) return
+    const snapshots = new Map<string, ReturnType<typeof ownEvents>>()
+    await Promise.all(slots.map(async slot => {
+      const { target, cursor } = slot
+      if (cursor === undefined || slot.error !== undefined || slot.updated) return
       try {
-        const events = await ownEvents(ctx, target.sessionId, signal)
-        const fresh = events.filter(event => event.seq > cursors.get(target.sessionId)!)
+        let snapshot = snapshots.get(target.sessionId)
+        if (!snapshot) {
+          snapshot = ownEvents(ctx, target.sessionId, signal)
+          snapshots.set(target.sessionId, snapshot)
+        }
+        const events = await snapshot
+        const fresh = events.filter(event => event.seq > cursor)
         const messages: unknown[] = target.replyTo ? fresh.flatMap(event => {
           const record = pluginRecordOf(event)
           const value = record?.data as unknown as DeliveryEvidence | undefined
@@ -41,18 +50,23 @@ export async function waitSessions(ctx: Context, callerId: string, targets: Sess
           return [{ seq: event.seq, messageId: value.message.id, source: value.message.source, text: value.text }]
         }) : foldMessages(fresh).map(row => ({ seq: row.seq, role: row.role, text: row.text ?? '' }))
         const stateChanges = target.replyTo ? [] : fresh.filter(event => ['turn/start', 'turn/end'].includes(event.type)).map(event => ({ seq: event.seq, type: event.type, data: event.data }))
-        cursors.set(target.sessionId, Math.max(cursors.get(target.sessionId)!, maxSeq(events)))
-        if (messages.length || stateChanges.length) updates.push({ sessionId: target.sessionId, messages, stateChanges })
+        slot.cursor = Math.max(cursor, maxSeq(events))
+        if (messages.length || stateChanges.length) {
+          updates.push({ ...identityOf(target), messages, stateChanges })
+          slot.updated = true
+        }
       } catch (error) {
-        if (!signal.aborted) errors.push({ sessionId: target.sessionId, error: error instanceof Error ? error.message : String(error) })
+        if (!signal.aborted) slot.error = error instanceof Error ? error.message : String(error)
       }
     }))
     const complete = mode === 'any' ? updates.length > 0 : updates.length === targets.length
     // Let the native driver claim steering instead of waiting on input parked behind this tool.
     pendingInput = (getLiveAgent(ctx, callerId)?.inbox?.nextStep?.length ?? 0) > 0
-    if (complete || pendingInput || errors.length === targets.length || Date.now() - started >= timeoutMs || signal.aborted) break
+    if (complete || pendingInput || slots.every(slot => slot.error !== undefined) || Date.now() - started >= timeoutMs || signal.aborted) break
     try { await delay(Math.min(25, timeoutMs - (Date.now() - started)), undefined, { signal }) } catch { break }
   }
   const complete = mode === 'any' ? updates.length > 0 : updates.length === targets.length
-  return { updates, cursors: targets.filter(target => cursors.has(target.sessionId)).map(target => sessionWaitTarget(target.sessionId, cursors.get(target.sessionId)!, target.replyTo)), errors, ...(pendingInput ? { pendingInput: true } : {}), timedOut: !signal.aborted && !pendingInput && !complete && Date.now() - started >= timeoutMs, aborted: signal.aborted }
+  const cursors = slots.flatMap(({ target, cursor }) => cursor === undefined ? [] : [sessionWaitTarget(target.sessionId, cursor, target.replyTo)])
+  const errors = slots.flatMap(({ target, error }) => error === undefined ? [] : [{ ...identityOf(target), error }])
+  return { updates, cursors, errors, ...(pendingInput ? { pendingInput: true } : {}), timedOut: !signal.aborted && !pendingInput && !complete && Date.now() - started >= timeoutMs, aborted: signal.aborted }
 }

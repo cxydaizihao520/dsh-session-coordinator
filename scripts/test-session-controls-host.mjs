@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 // Native rc.5 inbox/control methods on mounted scratch Sessions; no provider or desktop mutation.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
@@ -18,7 +19,7 @@ const method=(first,last,parameters=[],values=[])=>{const start=source.indexOf(f
 const cancel=method('\tcancel(cause, options = {}) {','\n\trunMaintenance(')
 const causeStart=source.indexOf('function abortedCancelCause('),causeEnd=source.indexOf('\n/** Drives',causeStart)
 const cancelCause=new Function('assertNever',source.slice(causeStart,causeEnd)+'\nreturn abortedCancelCause;')(value=>{throw Error('invalid native cancel cause '+JSON.stringify(value))})
-const turn=method('\tasync turn() {','\n\tasync step(', ['ToolCallRecovery','abortedCancelCause','LlmError','errorChain'],[ToolCallRecovery,cancelCause,LlmError,errorChain])
+const turn=method('\tasync turn() {','\n\tasync step(', ['ToolCallRecovery','abortedCancelCause','LlmError','errorChain','ToolActivationError'],[ToolCallRecovery,cancelCause,LlmError,errorChain,class ToolActivationError extends Error {}])
 const message=(id,text)=>({id,role:'user',source:{kind:'user'},content:[{type:'text',text}]})
 
 test('actual native command parser, lifecycle and cancellation reach shared human control without approval',async()=>{
@@ -44,7 +45,7 @@ test('actual native command parser, lifecycle and cancellation reach shared huma
  await(await tasks.env.collaboration).close();tasks.listeners.clear();tasks.reload();tasks.env.collaboration=installCollaboration(tasks.env,{store});await tasks.env.collaboration
  const owner=tasks.agents.get('A'),inputs=[];let wakes=0
  owner.phase={kind:'idle'}
- owner.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},owner.session,{emit(name,payload){for(const fn of tasks.listeners.get(name)??[])fn({agent:owner,...payload})}})
+ owner.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,owner.session,{emit(name,payload){for(const fn of tasks.listeners.get(name)??[])fn({agent:owner,...payload})}})
  const splice=owner.inbox.splice.bind(owner.inbox)
  owner.inbox.splice=(target,start,count,messages)=>{inputs.push({target,messages});return splice(target,start,count,messages)}
  owner.wakeDriver=()=>{wakes++;owner.inbox.claim('next-turn',1)}
@@ -71,7 +72,7 @@ function mounted(){
  const b=h.agents.get('B');b.session=session;b.phase={kind:'idle'}
  Object.defineProperty(b,'status',{get:()=>b.phase.kind==='idle'?'idle':'running'})
  root.on('session/event',(s,e)=>{for(const fn of h.listeners.get('session/event')??[])fn(s,e)})
- b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
+ b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
  b.steer=m=>b.inbox.append('next-step',m);b.followup=m=>b.inbox.append('next-turn',m);b.cancel=cancel
  h.human('A');return {...h,b,root,async close(){leave();await root.fiber.dispose()}}
 }
@@ -111,7 +112,7 @@ test('native cancel keeps unrelated inbox and native turn finally records the ob
  const h=mounted();try{
  const abort=new AbortController();h.b.phase={kind:'running',turn:0,step:0,abort,wakeRequested:false};h.b.ctx=h.root
  h.b.throwError=error=>{throw error};h.b.dispatch={serial:async()=>{}}
- h.b.preStep=async()=>{const payload={agent:h.b,turn:1,step:1,signal:abort.signal,messages:[message('active','work')]};return (h.listeners.get('agent/pre-step')??[]).reduceRight((tail,fn)=>()=>fn(payload,tail),async()=>({kind:'enter',messages:payload.messages}))()}
+ h.b.preStep=async()=>{const payload={agent:h.b,turn:1,step:1,signal:abort.signal,messages:[message('active','work')]};const decision=await (h.listeners.get('agent/pre-step')??[]).reduceRight((tail,fn)=>()=>fn(payload,tail),async()=>({kind:'enter',messages:payload.messages}))();return {...decision,toolSet:{dispose(){}}}}
  let started;const ready=new Promise(resolve=>started=resolve)
  h.b.step=async()=>{started();return new Promise((_resolve,reject)=>abort.signal.addEventListener('abort',()=>reject(abort.signal.reason),{once:true}))}
  const running=turn.call(h.b);running.catch(()=>{});await ready

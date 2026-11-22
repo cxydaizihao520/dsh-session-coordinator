@@ -1063,6 +1063,45 @@ await test('接收呈现: 宿主真实生成的任务和终态回信均保持身
   }
 })
 
+await test('接收呈现: 已授权工作第三次及后续回信保留原文，异常关联继续由宿主呈现', () => {
+  const { mod } = factoryOf(loadEntry())
+  const { ctx } = createCtx()
+  const events = conversationRegistry()
+  ctx.uiConversation = { events }
+  mod.apply(ctx)
+  const definition = events.entries().find(value => value.kind === 'session-coordinator-message')
+  const body = '复审通过。\n保留完整正文。'
+  const reply = { protocolVersion: 2, senderSessionId: 'B', senderLabel: '复核',
+    communicationHandle: 'communication-work', rootMessageId: 'first-dispatch' }
+  const eventFor = identity => ({
+    type: 'user/message', surfaceOp: 'append', seq: 10,
+    data: sourceIdentityMessage(body, { ...reply, ...identity }),
+  })
+  for (const [hopCount, replyTo, messageId] of [[3, 'initial-reply', 'revision'], [4, 'revision', 'final-reply']]) {
+    const event = eventFor({ hopCount, replyTo, messageId })
+    const before = JSON.stringify(event)
+    const match = definition.match(event)
+    assert.ok(match)
+    const state = definition.start({}, { ...match, event })
+    assert.equal(state.label, '复核')
+    assert.equal(state.body, body)
+    assert.equal(state.source.replyTo, replyTo)
+    assert.equal(JSON.stringify(event), before)
+  }
+  for (const invalid of [
+    { communicationHandle: undefined },
+    { protocolVersion: undefined },
+    { protocolVersion: 3 },
+    { replyTo: undefined },
+    { rootMessageId: 'revision' },
+    { rootMessageId: 'initial-reply' },
+    { replyTo: 'revision' },
+    { hopCount: 3.5 },
+  ]) {
+    assert.equal(definition.match(eventFor({ hopCount: 3, replyTo: 'initial-reply', messageId: 'revision', ...invalid })), null)
+  }
+})
+
 await test('接收与卡片: 真实账本请求上下文仅剥已知单行JSON，业务原文与旧格式不受影响', () => {
   const { mod } = factoryOf(loadEntry())
   const { ctx } = createCtx()
@@ -1306,6 +1345,7 @@ await historyTest('接收呈现: 未知 Chat Definition 共存时安全降级，
   let calls = 0
   const native = { kind: 'input-message', target: 'chat', match() { calls += 1; return null } }
   events.register(native)
+  events.register({ ...native, kind: 'answered-user-question' })
   mod.apply(ctx)
   const own = events.entries().find(definition => definition.kind === 'session-coordinator-message')
   const report = JSON.parse(fs.readFileSync(path.join(ROOT, 'docs/acceptance/desktop.json'), 'utf8'))

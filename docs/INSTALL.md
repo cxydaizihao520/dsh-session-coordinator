@@ -1,12 +1,14 @@
-# 安装 0.2.20 预览版
+# 安装 0.2.20
 
-npm 预览包可用后，在 DeepSeek Harness 的插件管理界面添加 `dsh-session-coordinator@beta`。支持 CLI 管理的 profile 也可运行：
+日常使用从 DeepSeek Harness 的 **插件 → 插件市场** 安装。没有市场页签时，先从 **插件 → 添加插件** 安装并启用 `dshmarket`。在市场搜索 `dsh-session-coordinator`，确认安装后，按提示刷新页面。在已安装列表确认版本为 0.2.20、组件正在运行。此流程已在干净的 macOS DSH 0.2.2-rc.5 上验证。
 
-```bash
-dsh plugin --profile desktop add dsh-session-coordinator@beta
-```
+需要传递或留存固定安装包时，从 [GitHub 0.2.20 正式发布](https://github.com/cxydaizihao520/dsh-session-coordinator/releases/tag/v0.2.20)下载 `dsh-session-coordinator-0.2.20.tgz`，按发布页核对 SHA-256。
 
-如果 CLI 提示桌面 profile 由运行中的应用独占，请使用应用内的插件管理。安装或升级后正常重启 Harness，在插件管理中核对实际版本。公开 npm 包使用预构建产物。
+## 固定 npm 版本
+
+在插件管理的 **添加插件** 中输入 `dsh-session-coordinator@0.2.20`，安装并启用。这个 [npm 版本](https://www.npmjs.com/package/dsh-session-coordinator/v/0.2.20) 与 GitHub 正式附件使用同一个验收包。
+
+## 源码安装
 
 从 GitHub 源码安装可使用：
 

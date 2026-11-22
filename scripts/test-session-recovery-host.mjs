@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 // Actual desktop Inbox and SDK SessionStore; controlled durability, no provider or desktop run.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
@@ -18,7 +19,7 @@ function mounted(){
   for(const id of ['A','B']){
     const a=h.agents.get(id),session=sessions.prepare(id)
     leave.push(sessions.enter(session));sessions.announce(session);a.session=session
-    a.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:a,...payload})}})
+    a.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:a,...payload})}})
     a.steer=m=>a.inbox.append('next-step',m);a.followup=m=>a.inbox.append('next-turn',m)
   }
   h.human('A')

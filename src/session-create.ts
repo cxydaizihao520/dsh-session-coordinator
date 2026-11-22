@@ -145,7 +145,12 @@ export async function createBridgeSession(
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     },
     setup: async (agentCtx: Context, agent?: LiveAgentLike) => {
-      if (agent) { createdAgent = agent; recordSessionModelSelection(agent, initialSelection) }
+      if (agent) {
+        createdAgent = agent
+        // The native AgentModel needs a route before the first request can be assembled.
+        const needsNativeDefault = agent.model && !provider && !model
+        recordSessionModelSelection(agent, needsNativeDefault ? readSessionModelSelection(agent) : initialSelection)
+      }
       if (requestedPreset !== undefined) {
         // 显式 agentPreset 就组合那一个预设。落到下面的 caller-join 会静默忽略请求：
         // id 仍然写进 session header，而 agent 实际跑在调用方的既有组合与工具上。

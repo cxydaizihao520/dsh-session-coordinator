@@ -1,3 +1,4 @@
+import {nativeInbox} from './fixtures/native-inbox.mjs'
 // Read installed host code; assemble/serialize scratch inputs, never call a provider.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
@@ -57,11 +58,14 @@ const nativeBuild=new Function('canonicalHeader','headerEquals','createDeveloper
 
 test('native first claim → assembly → refresh → append → request exposes only actual current inputs',async()=>{
  const h=fixture();h.human('A');const root=new Context(),prompt=new SystemPrompt(root,{});h.ctx.inject=(_names,fn)=>fn({systemPrompt:prompt});plugin.registerSessionPrompt(h.ctx,h.env.delivery);
- const b=h.agents.get('B');b.status='idle';b.phase={kind:'running',turn:1,step:1,abort:new AbortController()};b.loopCtx={systemPrompt:prompt};
- b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},b.session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}});
+ const b=h.agents.get('B');b.status='idle';b.phase={kind:'running',turn:1,step:1,abort:new AbortController()};b.model={current:()=>({provider:'probe',model:'probe'})};b.loopCtx={systemPrompt:prompt,tools:{resolve:async()=>({dispose(){},view:()=>new Map()})}};
+ b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,b.session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}});
  b.steer=m=>b.inbox.append('next-step',m);b.followup=m=>b.inbox.append('next-turn',m);
  b.dispatch={waterfall:async(name,payload,next)=>(h.listeners.get(name)??[]).reduceRight((tail,fn)=>()=>fn({agent:b,...payload},tail),next)()};
- b.runtimeContext={project:text=>text?{id:'runtime-context-first-step',role:'user',source:{kind:'runtime-context'},content:[{type:'text',text}]}:undefined};
+ b.runtimeContext={project(sections){
+  const text=Array.isArray(sections)?sections.map(section=>section.text).join('\n\n'):sections;
+  return text?{id:'runtime-context-first-step',role:'user',source:{kind:'runtime-context'},content:[{type:'text',text}]}:undefined;
+ }};
  const queued=await h.run('send',{targets:['B'],content:'future turn',delivery:'queue',requestId:'native-future-context'});
  const first=await h.run('send',{targets:['B'],content:'  exact first business\n',requestId:'native-first-context',authorizationRequest:{participants:['A','B'],purpose:'return report',extent:'message',reply:'once'}});
  assert.equal(b.session.snapshotEvents().filter(e=>e.type==='user/message').length,0);assert.doesNotMatch(h.env.delivery.modelContext(b),/"replyPermission"|"communicationHandle"|"replyTo"/,'pending input is not model context');
@@ -77,7 +81,7 @@ test('native first claim → assembly → refresh → append → request exposes
 
 test('native queued steering releases cursor wait and remains available for the next model step',async()=>{
  const h=fixture();h.human('A');const b=h.agents.get('B');b.status='running'
- b.inbox=new ReactLoopInbox({stateOf:s=>s.snapshotEvents().reduce((state,event)=>inboxProjectionDefinition.apply(state,event),inboxProjectionDefinition.init())},b.session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
+ b.inbox=nativeInbox(ReactLoopInbox,inboxProjectionDefinition,b.session,{emit(name,payload){for(const fn of h.listeners.get(name)??[])fn({agent:b,...payload})}})
  b.steer=m=>b.inbox.append('next-step',m);b.followup=m=>b.inbox.append('next-turn',m)
  b.session.append('turn/start',{turn:1})
  for(const fn of h.listeners.get('agent/pre-step')??[])await fn({agent:b,turn:1,step:1,signal:new AbortController().signal,messages:[]},async()=>({kind:'enter',messages:[]}))
