@@ -54,9 +54,13 @@ pnpm pack
 
 npm、独立图标和截图都不是收录前置条件。没有 npm 时，只要公开源码确实可安装即可；源码完全不能安装时，按指南提供 GitHub Release 的预构建 tarball。
 
-npm 使用已审查的固定 tgz；先核对清单、生命周期脚本和文件，再使用官方 CLI 的 `npm publish <固定tgz> --dry-run --ignore-scripts --registry=https://registry.npmjs.org/` 模拟。dry-run 不证明服务端最终接受包名或发布权限。
+### 通过 GitHub Actions 发布到 npm
 
-正式发布仍需现有任务明确授权，并由账号持有人完成必要的交互验证。每次内容更新使用新版本号；已发布同名同版本不能覆盖。发布后读回版本、标签、dist.integrity，再从 registry 按包名执行隔离安装。GitHub 更新与 npm 更新是独立动作。
+1. 为已验收的新版本发布 GitHub Release，上传 `dsh-session-coordinator-<版本>.tgz` 并记下验收包的 SHA-256。包内 `package.json` 的名称、版本和 `repository.url` 须与当前仓库及 Release 对应。
+2. 首次使用时，在 npm 把包 `dsh-session-coordinator` 绑定到仓库 `cxydaizihao520/dsh-session-coordinator`、工作流 `npm-publish.yml` 和环境 `npm-release`，允许 `npm publish`。账号持有人只需确认这次配置。绑定创建后须在两天内首次成功发布，所以下个包准备好时再绑定。 [npm Trusted Publishing 文档](https://docs.npmjs.com/trusted-publishers/)
+3. 在 GitHub Actions 打开 **Publish npm release**，从 `main` 手动输入 Release 标签及 SHA-256。默认仅核验。勾选 **Publish to npm after verifying the tarball** 才会发布。正式 Release 使用 `latest`，预发布使用 `beta`。
+
+工作流核对原始附件及其包清单，通过 OIDC 发布同一个文件，再与公开 npm 下载逐字节比对。0.2.20 及更早版本不会经过此发布入口。
 
 若选择 Release tarball，只有实际可下载后才填 tarball 字段。使用 latest/download 时文件名不带版本；带版本文件名须固定 Release tag。不要填写未来地址。
 

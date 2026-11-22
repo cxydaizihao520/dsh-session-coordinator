@@ -1,0 +1,98 @@
+name: Publish npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub Release tag, for example v0.2.21
+        required: true
+        type: string
+      sha256:
+        description: SHA-256 of the accepted release tarball
+        required: true
+        type: string
+      publish:
+        description: Publish to npm after verifying the tarball
+        default: false
+        type: boolean
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'cxydaizihao520/dsh-session-coordinator' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Verify the approved GitHub Release tarball
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SHA: ${{ inputs.sha256 }}
+        run: |
+          read -r version channel expected_sha < <(python3 - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["RELEASE_TAG"]
+          sha = os.environ["EXPECTED_SHA"]
+          number = r"(0|[1-9][0-9]*)"
+          match = re.fullmatch(rf"v{number}\.{number}\.{number}(-[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)?", tag)
+          if match is None or tuple(map(int, match.groups()[:3])) <= (0, 2, 20):
+              raise SystemExit("Choose a version after 0.2.20.")
+          prerelease = match[4]
+          if prerelease and any(part.isdigit() and part.startswith("0") and len(part) > 1
+                                for part in prerelease[1:].split(".")):
+              raise SystemExit("The release tag is not a valid semantic version.")
+          if re.fullmatch(r"[0-9a-fA-F]{64}", sha) is None:
+              raise SystemExit("Supply the approved tarball SHA-256.")
+          print(tag[1:], "beta" if prerelease else "latest", sha.lower())
+          PY
+          )
+          asset="dsh-session-coordinator-${version}.tgz"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease |
+            jq -e --arg tag "$RELEASE_TAG" --arg channel "$channel" '
+              .tagName == $tag and (.isDraft | not) and (.isPrerelease == ($channel == "beta"))
+            ' >/dev/null
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+          printf '%s  %s\n' "$expected_sha" "$asset" | sha256sum -c -
+          tar -xOzf "$asset" package/package.json |
+            jq -e --arg version "$version" --arg repo "git+https://github.com/${GITHUB_REPOSITORY}.git" '
+              .name == "dsh-session-coordinator" and .version == $version and .repository.url == $repo
+            ' >/dev/null
+          printf 'asset=%s\nchannel=%s\n' "$asset" "$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js for npm Trusted Publishing
+        if: inputs.publish
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Publish the same tarball through OIDC
+        if: inputs.publish
+        env:
+          ASSET: ${{ steps.artifact.outputs.asset }}
+          CHANNEL: ${{ steps.artifact.outputs.channel }}
+        run: |
+          npm_tarball="https://registry.npmjs.org/dsh-session-coordinator/-/$ASSET"
+          verification_url="$npm_tarball?verify=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          status=$(curl --silent --show-error --max-time 30 --retry 3 --output npm-download.tgz --write-out '%{http_code}' "$verification_url")
+          case "$status" in
+            200) cmp "$ASSET" npm-download.tgz; exit 0 ;;
+            404) npm publish "./$ASSET" --ignore-scripts --access public --tag "$CHANNEL" ;;
+            *) printf 'npm returned HTTP %s\n' "$status" >&2; exit 1 ;;
+          esac
+          curl --fail --silent --show-error --max-time 30 --retry 5 --retry-all-errors \
+            --header 'Cache-Control: no-cache' --output npm-download.tgz "$npm_tarball"
+          cmp "$ASSET" npm-download.tgz
